@@ -3,24 +3,12 @@ from moo_algorithm.nsga_ii import run_nsga_ii
 from moo_algorithm.nsga_iii import run_nsga_iii
 from moo_algorithm.pfg_moea import run_pfgmoea
 from moo_algorithm.agea import run_agea
-from moo_algorithm.iagea import run_iagea
 from moo_algorithm.ciagea import run_ciagea
 from operators import crossover_PMX, mutation_flip
 
 ALGORITHMS = {
     "CIAGEA": {
         "runner": run_ciagea,
-        "params": {
-            "init_div": 10,
-            "crossover_operator": crossover_PMX,
-            "mutation_operator": mutation_flip,
-            "crossover_rate": 0.9,
-            "mutation_rate": 0.1,
-        },
-        "ref_point": [24, 100000],
-    },
-    "IAGEA": {
-        "runner": run_iagea,
         "params": {
             "init_div": 10,
             "crossover_operator": crossover_PMX,

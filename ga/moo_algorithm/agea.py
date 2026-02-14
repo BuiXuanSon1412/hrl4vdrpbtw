@@ -264,6 +264,66 @@ class AGEAPopulation(Population):
         return ParetoFront
 
 
+def save_generation_snapshot(agea_pop, gen, detailed_history):
+    """Save detailed information about current generation."""
+
+    # 1. Collect all solutions' fitness values
+    all_fitness = []
+    for ind in agea_pop.indivs:
+        if ind.objectives:
+            all_fitness.append(list(ind.objectives))
+
+    # 2. Collect Pareto front fitness
+    pareto_fitness = []
+    if agea_pop.ParetoFront and len(agea_pop.ParetoFront) > 0:
+        for ind in agea_pop.ParetoFront[0]:
+            if ind.objectives:
+                pareto_fitness.append(list(ind.objectives))
+
+    # 3. Grid information
+    grid_spacing = agea_pop.calculate_grid_spacing()
+    lower_boundaries = agea_pop.calculate_lower_boundaries(grid_spacing)
+
+    # 4. Count solutions per grid cell
+    grid_distribution = {}
+    for idx in agea_pop.grid_indices:
+        grid_key = str(idx)
+        grid_distribution[grid_key] = grid_distribution.get(grid_key, 0) + 1
+
+    # 5. Calculate diversity metrics
+    unique_grids = len(set(agea_pop.grid_indices))
+    grid_diversity = (
+        unique_grids / len(agea_pop.grid_indices) if agea_pop.grid_indices else 0
+    )
+
+    # 6. Save snapshot
+    detailed_history["generations"][str(gen)] = {
+        "all_solutions": all_fitness,
+        "pareto_front": pareto_fitness,
+        "grid_info": {
+            "div": agea_pop.div,
+            "ideal_point": agea_pop.ideal_point.tolist()
+            if agea_pop.ideal_point is not None
+            else None,
+            "grid_nadir": agea_pop.grid_nadir.tolist()
+            if agea_pop.grid_nadir is not None
+            else None,
+            "grid_spacing": grid_spacing.tolist(),
+            "lower_boundaries": lower_boundaries.tolist(),
+            "unique_grids": unique_grids,
+            "grid_diversity": grid_diversity,
+            "grid_distribution": grid_distribution,
+        },
+        "population_stats": {
+            "size": len(agea_pop.indivs),
+            "pareto_front_size": len(agea_pop.ParetoFront[0])
+            if agea_pop.ParetoFront
+            else 0,
+        },
+    }
+    print("save detailed history")
+
+
 def run_agea(
     processing_number,
     problem,
@@ -279,6 +339,17 @@ def run_agea(
 ):
     print("AGEA")
     history = {}
+
+    detailed_history = {
+        "config": {
+            "pop_size": pop_size,
+            "max_gen": max_gen,
+            "init_div": init_div,
+            "crossover_rate": crossover_rate,
+            "mutation_rate": mutation_rate,
+        },
+        "generations": {},
+    }
 
     agea_pop = AGEAPopulation(pop_size, init_div)
     agea_pop.pre_indi_gen(indi_list)
@@ -311,10 +382,16 @@ def run_agea(
     agea_pop.ParetoFront = [fronts[0]] if fronts else [[]]
     Pareto_store = [list(indi.objectives) for indi in agea_pop.ParetoFront[0]]
     history[0] = Pareto_store
+
+    save_generation_snapshot(agea_pop, 0, detailed_history)
+
     print("Generation 0: Done")
 
     # Evolution loop
     for gen in range(max_gen):
+        print(
+            f"generation {gen}: (pop_size: {len(agea_pop.indivs)}), (div: {agea_pop.div})"
+        )
         # Generate offspring
         offspring = agea_pop.gen_offspring(
             problem,
@@ -369,6 +446,10 @@ def run_agea(
         Pareto_store = [list(indi.objectives) for indi in agea_pop.ParetoFront[0]]
         history[gen + 1] = Pareto_store
 
+        # ADD THIS: Save detailed snapshot every 10 generations
+        if (gen + 1) % 10 == 0:
+            save_generation_snapshot(agea_pop, gen + 1, detailed_history)
+
     pool.close()
     print("AGEA Done: ", cal_hv_front(agea_pop.ParetoFront[0], np.array([10, 100000])))
-    return history
+    return {"history": history, "detailed_history": detailed_history}

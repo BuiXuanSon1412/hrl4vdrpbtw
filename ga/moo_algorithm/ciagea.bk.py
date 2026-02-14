@@ -229,44 +229,38 @@ class CIAGEAPopulation(Population):
         return crowding
 
     def population_reselection(self, solutions, grid_indices):
+        """Population reselection based on crowding degree"""
         if len(solutions) <= self.pop_size:
             return solutions
 
         M = len(grid_indices[0]) if grid_indices else 1
         crowding = self.calculate_crowding_degree(grid_indices)
+
+        # Calculate fitness (Eq. 14)
         max_crowding = max(crowding) if crowding else 1
 
+        # Handle case when all solutions have 0 neighbors
         if max_crowding == 0:
-            # Prioritize boundary solutions instead of random
-            boundary_count = []
-            for idx in grid_indices:
-                is_boundary = any(i == 0 for i in idx)
-                boundary_count.append(1 if is_boundary else 0)
+            # Random selection when all equally sparse
+            selected_idx = np.random.choice(
+                len(solutions), size=self.pop_size, replace=False
+            )
+            return [solutions[int(i)] for i in cast(Any, selected_idx)]
 
-            if sum(boundary_count) >= self.pop_size:
-                # Keep all boundary solutions
-                selected = [s for s, b in zip(solutions, boundary_count) if b]
-                remaining = self.pop_size - len(selected)
-                non_boundary = [s for s, b in zip(solutions, boundary_count) if not b]
-                selected.extend(
-                    np.random.choice(non_boundary, remaining, replace=False)
-                )
-                return selected
-
-        # Original fitness calculation
         fitness = []
         for c in crowding:
             f = (self.pop_size - 1) * (c ** (1 / M)) / (max_crowding ** (1 / M)) + 1
             fitness.append(f)
 
+        # Roulette wheel selection
         fitness = np.array(fitness)
+        # Invert fitness (lower crowding = higher selection probability)
         fitness = max(fitness) - fitness + 1
         probs = fitness / fitness.sum()
 
         selected_idx = np.random.choice(
             len(solutions), size=self.pop_size, replace=False, p=probs
         )
-
         return [solutions[i] for i in cast(Any, selected_idx)]
 
     def fast_nondominated_sort(self, solutions):
@@ -405,18 +399,16 @@ def run_ciagea(
     # Store initial Pareto front
     ciagea_pop.ParetoFront = [fronts[0]] if fronts else [[]]
     Pareto_store = [list(indi.objectives) for indi in ciagea_pop.ParetoFront[0]]
-    history[0] = Pareto_store
+    history[0] = [Pareto_store, ciagea_pop.div]
     print("Generation 0: Done")
 
     # Evolution loop
     for gen in range(max_gen):
-        print(
-            f"generation {gen}: (pop_size: {len(ciagea_pop.indivs)}), (div: {ciagea_pop.div})"
-        )
+        print(f"generation {gen}: {len(ciagea_pop.indivs)}")
         # ========================================================================
         # DIVERSITY RESTART - FIXED: Less aggressive
         # ========================================================================
-        """
+        # FIXED: Changed from every 20 to every 35 generations
         if gen % 35 == 0 and gen > 0:
             if not ciagea_pop.check_diversity():
                 print(f"  Diversity restart at generation {gen}")
@@ -454,7 +446,7 @@ def run_ciagea(
                 print(
                     f"  Diversity restored: {len(set(ciagea_pop.grid_indices))} unique grid locations"
                 )
-        """
+
         # ========================================================================
         # NORMAL EVOLUTION
         # ========================================================================
@@ -470,7 +462,6 @@ def run_ciagea(
 
         # Apply local search to some offspring
         # FIXED: Reduced from 40% to 30%
-        """
         ls_offspring = []
         for off in offspring:
             if np.random.random() < 0.3:
@@ -480,8 +471,7 @@ def run_ciagea(
                 ls_offspring.append(improved)
             else:
                 ls_offspring.append(off)
-        """
-        ls_offspring = offspring
+
         # Evaluate offspring
         arg = [(problem, individual) for individual in ls_offspring]
         result = pool.starmap(cal_fitness, arg)
@@ -528,7 +518,7 @@ def run_ciagea(
 
         print(f"Generation {gen + 1}: Done")
         Pareto_store = [list(indi.objectives) for indi in ciagea_pop.ParetoFront[0]]
-        history[gen + 1] = Pareto_store
+        history[gen + 1] = [Pareto_store, ciagea_pop.div]
 
     pool.close()
     print(

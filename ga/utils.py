@@ -68,10 +68,7 @@ def unset(chro, problem: Problem):
             chro[1][i] = 0
 
 
-def truckset(chro, seq, problem: Problem):
-    pass
-
-
+# check if the truck overloads
 def overload(chro, problem: Problem):
     demands = [node.demand for node in problem.nodes]
     load = 0
@@ -88,6 +85,7 @@ def overload(chro, problem: Problem):
     return False
 
 
+#
 def dronable(chro, problem: Problem):
     n_node = len(problem.nodes)
     # the sequential drone nodes must have same sign
@@ -130,7 +128,7 @@ def dronable(chro, problem: Problem):
                             break
 
                 # violate traveling range and payload
-                # -> switch sign of mask value from current violated gene
+                # solved by: switch sign of mask value from current violated gene
                 if (
                     temp_in_distance > problem.drone_speed * problem.drone_trip_duration
                     or overloaded

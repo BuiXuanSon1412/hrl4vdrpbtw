@@ -3,18 +3,14 @@ import sys
 import os
 import numpy as np
 from typing import cast, Any
-from copy import deepcopy
-import random
 
 # Add the parent directory to the module search path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from moo_algorithm.metric import cal_hv_front
-from population import Population, Individual
-from local_move import local_insert, local_flip, local_swap, local_invert
-from utils import init_population
+from population import Population
 
 
-class CIAGEAPopulation(Population):
+class AGEAPopulation(Population):
     def __init__(self, pop_size, init_div=10):
         super().__init__(pop_size)
         self.div = init_div
@@ -22,31 +18,6 @@ class CIAGEAPopulation(Population):
         self.ideal_point = None
         self.grid_indices = []
         self.ParetoFront = []
-        self.archive = []
-        self.archive_size = min(50, pop_size // 2)
-
-    def update_archive(self, new_solutions):
-        """Maintain archive of best solutions"""
-        # Combine archive with new solutions
-        combined = self.archive + new_solutions
-
-        # Fast non-dominated sort
-        fronts = self.fast_nondominated_sort(combined)
-
-        # Keep only first front, limited by archive size
-        self.archive = fronts[0][: self.archive_size] if fronts else []
-
-    def check_diversity(self):
-        """Check if population has converged"""
-        if len(self.indivs) < 2:
-            return True
-
-        # Check grid diversity
-        unique_grids = len(set(self.grid_indices))
-        diversity_ratio = unique_grids / len(self.grid_indices)
-
-        # FIXED: Lower threshold from 0.3 to 0.2
-        return diversity_ratio > 0.2
 
     def update_ideal_point(self, solutions):
         """Update ideal point from solutions"""
@@ -229,44 +200,38 @@ class CIAGEAPopulation(Population):
         return crowding
 
     def population_reselection(self, solutions, grid_indices):
+        """Population reselection based on crowding degree"""
         if len(solutions) <= self.pop_size:
             return solutions
 
         M = len(grid_indices[0]) if grid_indices else 1
         crowding = self.calculate_crowding_degree(grid_indices)
+
+        # Calculate fitness (Eq. 14)
         max_crowding = max(crowding) if crowding else 1
 
+        # Handle case when all solutions have 0 neighbors
         if max_crowding == 0:
-            # Prioritize boundary solutions instead of random
-            boundary_count = []
-            for idx in grid_indices:
-                is_boundary = any(i == 0 for i in idx)
-                boundary_count.append(1 if is_boundary else 0)
+            # Random selection when all equally sparse
+            selected_idx = np.random.choice(
+                len(solutions), size=self.pop_size, replace=False
+            )
+            return [solutions[int(i)] for i in cast(Any, selected_idx)]
 
-            if sum(boundary_count) >= self.pop_size:
-                # Keep all boundary solutions
-                selected = [s for s, b in zip(solutions, boundary_count) if b]
-                remaining = self.pop_size - len(selected)
-                non_boundary = [s for s, b in zip(solutions, boundary_count) if not b]
-                selected.extend(
-                    np.random.choice(non_boundary, remaining, replace=False)
-                )
-                return selected
-
-        # Original fitness calculation
         fitness = []
         for c in crowding:
             f = (self.pop_size - 1) * (c ** (1 / M)) / (max_crowding ** (1 / M)) + 1
             fitness.append(f)
 
+        # Roulette wheel selection
         fitness = np.array(fitness)
+        # Invert fitness (lower crowding = higher selection probability)
         fitness = max(fitness) - fitness + 1
         probs = fitness / fitness.sum()
 
         selected_idx = np.random.choice(
             len(solutions), size=self.pop_size, replace=False, p=probs
         )
-
         return [solutions[i] for i in cast(Any, selected_idx)]
 
     def fast_nondominated_sort(self, solutions):
@@ -298,68 +263,8 @@ class CIAGEAPopulation(Population):
 
         return ParetoFront
 
-    def adaptive_local_search(
-        self, individual, problem, generation, max_gen, current_population
-    ):
-        """Apply local search with FIXED issues from original"""
 
-        # FIXED: Slower decay - was too aggressive
-        ls_probability = 0.6 * (1 - (generation / max_gen) ** 0.35)
-
-        if np.random.random() > ls_probability:
-            return individual
-
-        # Grid-based selection - only apply LS to sparse regions
-        if hasattr(individual, "objectives") and individual.objectives:
-            grid_spacing = self.calculate_grid_spacing()
-            lower_boundaries = self.calculate_lower_boundaries(grid_spacing)
-            ind_grid = self.calculate_grid_index(
-                individual, lower_boundaries, grid_spacing
-            )
-
-            grid_count = sum(1 for idx in self.grid_indices if idx == ind_grid)
-
-            # FIXED: More lenient threshold - was skipping too many
-            if grid_count > 4:  # Changed from 3
-                return individual
-
-        # Multi-start local search
-        best_improved = Individual(deepcopy(individual.chromosome))
-
-        # FIXED: More exploration attempts
-        num_tries = 2  # Increased from 1-2 variable
-
-        for _ in range(num_tries):
-            current = Individual(deepcopy(individual.chromosome))
-
-            # FIXED: Better depth scaling
-            if generation < max_gen * 0.4:  # Extended early phase
-                depth = random.randint(3, 5)
-            else:
-                depth = random.randint(2, 4)  # Increased minimum
-
-            for step in range(depth):
-                # Mix of different operators for diversity
-                move_probs = [0.3, 0.3, 0.2, 0.2]  # swap, insert, invert, flip
-                move_type = np.random.choice(
-                    ["swap", "insert", "invert", "flip"], p=move_probs
-                )
-
-                if move_type == "swap":
-                    current = local_swap(current)
-                elif move_type == "insert":
-                    current = local_insert(current)
-                elif move_type == "invert":
-                    current = local_invert(current)
-                else:  # flip
-                    current = local_flip(current, problem)
-
-            best_improved = current
-
-        return best_improved
-
-
-def run_ciagea(
+def run_agea(
     processing_number,
     problem,
     indi_list,
@@ -372,95 +277,49 @@ def run_ciagea(
     mutation_rate,
     cal_fitness,
 ):
-    print("CIAGEA (Minimal Fixed)")
+    print("AGEA")
     history = {}
 
-    ciagea_pop = CIAGEAPopulation(pop_size, init_div)
-    ciagea_pop.pre_indi_gen(indi_list)
+    agea_pop = AGEAPopulation(pop_size, init_div)
+    agea_pop.pre_indi_gen(indi_list)
 
     pool = multiprocessing.Pool(processing_number)
 
     # Initial evaluation
-    arg = [(problem, individual) for individual in ciagea_pop.indivs]
+    arg = [(problem, individual) for individual in agea_pop.indivs]
     result = pool.starmap(cal_fitness, arg)
-    for individual, fitness in zip(ciagea_pop.indivs, result):
+    for individual, fitness in zip(agea_pop.indivs, result):
         individual.chromosome = fitness[0]
         individual.objectives = fitness[1:]
 
     # Update ideal point
-    ciagea_pop.update_ideal_point(ciagea_pop.indivs)
+    agea_pop.update_ideal_point(agea_pop.indivs)
 
     # Non-dominated sorting to get non-dominated solutions
-    fronts = ciagea_pop.fast_nondominated_sort(ciagea_pop.indivs)
+    fronts = agea_pop.fast_nondominated_sort(agea_pop.indivs)
     nd_solutions = fronts[0] if fronts else []
 
     # Update grid nadir
-    ciagea_pop.update_grid_nadir(nd_solutions)
+    agea_pop.update_grid_nadir(nd_solutions)
 
     # Adaptive grid adjustment and environmental selection
-    selected, grid_indices = ciagea_pop.adaptive_grid_adjustment(ciagea_pop.indivs)
-    ciagea_pop.indivs = selected
-    ciagea_pop.grid_indices = grid_indices
+    selected, grid_indices = agea_pop.adaptive_grid_adjustment(agea_pop.indivs)
+    agea_pop.indivs = selected
+    agea_pop.grid_indices = grid_indices
 
     # Store initial Pareto front
-    ciagea_pop.ParetoFront = [fronts[0]] if fronts else [[]]
-    Pareto_store = [list(indi.objectives) for indi in ciagea_pop.ParetoFront[0]]
+    agea_pop.ParetoFront = [fronts[0]] if fronts else [[]]
+    Pareto_store = [list(indi.objectives) for indi in agea_pop.ParetoFront[0]]
     history[0] = Pareto_store
     print("Generation 0: Done")
 
     # Evolution loop
     for gen in range(max_gen):
         print(
-            f"generation {gen}: (pop_size: {len(ciagea_pop.indivs)}), (div: {ciagea_pop.div})"
+            f"generation {gen}: (pop_size: {len(agea_pop.indivs)}), (div: {agea_pop.div})"
         )
-        # ========================================================================
-        # DIVERSITY RESTART - FIXED: Less aggressive
-        # ========================================================================
-        """
-        if gen % 35 == 0 and gen > 0:
-            if not ciagea_pop.check_diversity():
-                print(f"  Diversity restart at generation {gen}")
-
-                # FIXED: Reduced from 1/3 to 1/5 of population
-                num_new = pop_size // 5
-                new_indivs = init_population(num_new, 42 + gen, problem)
-
-                # Evaluate new individuals
-                arg = [(problem, individual) for individual in new_indivs]
-                result = pool.starmap(cal_fitness, arg)
-                for individual, fitness in zip(new_indivs, result):
-                    individual.chromosome = fitness[0]
-                    individual.objectives = fitness[1:]
-
-                # Combine with current population
-                combined = ciagea_pop.indivs + new_indivs
-
-                # Update ideal point with combined population
-                ciagea_pop.update_ideal_point(combined)
-
-                # Re-run environmental selection
-                selected, grid_indices = ciagea_pop.adaptive_grid_adjustment(combined)
-
-                # Ensure we keep pop_size individuals
-                if len(selected) > pop_size:
-                    ciagea_pop.indivs = ciagea_pop.population_reselection(
-                        selected, grid_indices
-                    )
-                else:
-                    ciagea_pop.indivs = selected
-
-                ciagea_pop.grid_indices = grid_indices[: len(ciagea_pop.indivs)]
-
-                print(
-                    f"  Diversity restored: {len(set(ciagea_pop.grid_indices))} unique grid locations"
-                )
-        """
-        # ========================================================================
-        # NORMAL EVOLUTION
-        # ========================================================================
-
         # Generate offspring
-        offspring = ciagea_pop.gen_offspring(
+        offspring = agea_pop.gen_offspring(
             problem,
             crossover_operator,
             mutation_operator,
@@ -468,38 +327,21 @@ def run_ciagea(
             mutation_rate,
         )
 
-        # Apply local search to some offspring
-        # FIXED: Reduced from 40% to 30%
-        """
-        ls_offspring = []
-        for off in offspring:
-            if np.random.random() < 0.3:
-                improved = ciagea_pop.adaptive_local_search(
-                    off, problem, gen, max_gen, None
-                )
-                ls_offspring.append(improved)
-            else:
-                ls_offspring.append(off)
-        """
-        ls_offspring = offspring
         # Evaluate offspring
-        arg = [(problem, individual) for individual in ls_offspring]
+        arg = [(problem, individual) for individual in offspring]
         result = pool.starmap(cal_fitness, arg)
-        for individual, fitness in zip(ls_offspring, result):
+        for individual, fitness in zip(offspring, result):
             individual.chromosome = fitness[0]
             individual.objectives = fitness[1:]
 
-        # FIXED: Actually use archive
-        ciagea_pop.update_archive(ls_offspring)
-
         # Combine population and offspring
-        combined = ciagea_pop.indivs + ls_offspring
+        combined = agea_pop.indivs + offspring
 
         # Update ideal point
-        ciagea_pop.update_ideal_point(combined)
+        agea_pop.update_ideal_point(combined)
 
         # Non-dominated sorting
-        fronts = ciagea_pop.fast_nondominated_sort(combined)
+        fronts = agea_pop.fast_nondominated_sort(combined)
 
         # Select solutions that can enter grid (first N_pop from fronts)
         grid_candidates = []
@@ -514,24 +356,22 @@ def run_ciagea(
         nd_solutions = fronts[0] if fronts else []
 
         # Update grid nadir
-        ciagea_pop.update_grid_nadir(nd_solutions)
+        agea_pop.update_grid_nadir(nd_solutions)
 
         # Adaptive grid adjustment and environmental selection
-        selected, grid_indices = ciagea_pop.adaptive_grid_adjustment(grid_candidates)
+        selected, grid_indices = agea_pop.adaptive_grid_adjustment(grid_candidates)
 
         # Population reselection
-        ciagea_pop.indivs = ciagea_pop.population_reselection(selected, grid_indices)
-        ciagea_pop.grid_indices = grid_indices[: len(ciagea_pop.indivs)]
+        agea_pop.indivs = agea_pop.population_reselection(selected, grid_indices)
+        agea_pop.grid_indices = grid_indices[: len(agea_pop.indivs)]
 
         # Update Pareto front
-        ciagea_pop.ParetoFront = [fronts[0]] if fronts else [[]]
+        agea_pop.ParetoFront = [fronts[0]] if fronts else [[]]
 
         print(f"Generation {gen + 1}: Done")
-        Pareto_store = [list(indi.objectives) for indi in ciagea_pop.ParetoFront[0]]
+        Pareto_store = [list(indi.objectives) for indi in agea_pop.ParetoFront[0]]
         history[gen + 1] = Pareto_store
 
     pool.close()
-    print(
-        "CIAGEA Done: ", cal_hv_front(ciagea_pop.ParetoFront[0], np.array([10, 100000]))
-    )
+    print("AGEA Done: ", cal_hv_front(agea_pop.ParetoFront[0], np.array([10, 100000])))
     return history

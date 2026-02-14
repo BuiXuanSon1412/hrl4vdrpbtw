@@ -9,15 +9,7 @@ from typing import Callable, Dict, Any
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from problem import Problem
-from utils import init_population, cal_fitness, cal_tardiness, cal_cost, decode
-from operators import crossover_PMX, mutation_flip
-from moo_algorithm.moead import run_moead, init_weight_vectors_2d
-from moo_algorithm.nsga_ii import run_nsga_ii
-from moo_algorithm.nsga_iii import run_nsga_iii
-from moo_algorithm.pfg_moea import run_pfgmoea
-from moo_algorithm.agea import run_agea
-from moo_algorithm.iagea import run_iagea
-from moo_algorithm.ciagea import run_ciagea
+from utils import init_population, cal_fitness
 from config import ALGORITHMS
 
 
