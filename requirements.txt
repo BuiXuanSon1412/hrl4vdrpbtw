@@ -37,9 +37,8 @@ sympy==1.14.0
 torch==2.9.0
 triton==3.5.0
 typing_extensions==4.15.0
-pandas
+pandas==3.0.0
+pymoo==0.6.1.6
 pulp
 ortools
-pymoo
-numpy
-matplotlib
+
