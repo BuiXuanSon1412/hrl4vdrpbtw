@@ -1,387 +1,228 @@
 """
 agents/ppo_agent.py
 --------------------
-Proximal Policy Optimisation (PPO-clip) agent for combinatorial RL.
+PPO agent — supports both flat array observations (Knapsack)
+and dict observations (VRPBTW with HACN network).
 
-Covers the full RL procedure:
-  1. Rollout collection (actor inference with action masking)
-  2. GAE advantage estimation  (in RolloutBuffer)
-  3. Multiple epochs of clipped surrogate + value + entropy loss
-  4. Gradient clipping
-  5. Adaptive KL early-stopping
-  6. Checkpoint save / load
+Key changes vs original
+------------------------
+- select_action accepts obs as either np.ndarray or dict
+- If obs is a dict (VRPBTW), batches both node_features and vehicle_features
+  and passes the dict to the network
+- collect() reads node_features / vehicle_features from info when available
+- The rollout buffer stores the FLAT obs for Knapsack; for VRPBTW it stores
+  node_features as the primary obs (vehicle_features are recomputed at
+  update time from the stored obs — NOT stored separately, to keep buffer simple)
+- update() calls network.train() (mode management fix)
 """
 
 from __future__ import annotations
 
-import os
-import time
-from dataclasses import dataclass, field
+import dataclasses
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-
 import torch
-import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
 
-# import needed for reward normalisation fallback
-import math
-
-from core.buffers import RolloutBuffer, Batch
-from networks.policy_network import PolicyNetwork, NetworkConfig
 from .base_agent import BaseAgent
-
-
-# ---------------------------------------------------------------------------
-# Hyper-parameter dataclass
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class PPOConfig:
-    # Network
-    embed_dim: int = 128
-    n_heads: int = 8
-    n_encoder_layers: int = 3
-    dropout: float = 0.0
-    use_attention: bool = True
-    clip_logits: float = 10.0
-
-    # PPO
-    lr: float = 3e-4
-    gamma: float = 0.99
-    gae_lambda: float = 0.95
-    clip_eps: float = 0.2
-    value_coef: float = 0.5
-    entropy_coef: float = 0.01
-    max_grad_norm: float = 0.5
-    n_epochs: int = 4
-    mini_batch_size: int = 256
-    rollout_len: int = 2048
-    target_kl: Optional[float] = 0.015  # None to disable early-stop
-
-    # Misc
-    device: str = "cpu"
-    normalize_rewards: bool = True
-
-
-# ---------------------------------------------------------------------------
-# PPO Agent
-# ---------------------------------------------------------------------------
+from algorithms.ppo import ppo_update
+from buffers import RolloutBuffer
+from configs import PPOConfig
+from networks.base_network import BaseNetwork
+from utils.normalizer import RunningNormalizer
 
 
 class PPOAgent(BaseAgent):
-    """
-    On-policy PPO agent with clipped surrogate objective.
-
-    Full RL cycle
-    -------------
-    For each training iteration:
-      1. ``collect_rollout(env, n_steps)``   → fill RolloutBuffer
-      2. ``update(buffer)``                  → gradient updates, return metrics
-      3. ``save / load``                     → checkpointing
-
-    Inference
-    ---------
-      action = agent.select_action(obs, action_mask, training=False)
-    """
-
     def __init__(
         self,
+        network: BaseNetwork,
         obs_shape: Tuple[int, ...],
         action_space_size: int,
-        cfg: Optional[PPOConfig] = None,
+        cfg: PPOConfig,
+        device: str = "cpu",
     ):
+        self.network = network
         self.obs_shape = obs_shape
         self.action_space_size = action_space_size
-        self.cfg = cfg or PPOConfig()
+        self.cfg = cfg
+        self.device = device
 
-        net_cfg = NetworkConfig(
-            obs_shape=obs_shape,
-            action_space_size=action_space_size,
-            embed_dim=self.cfg.embed_dim,
-            n_heads=self.cfg.n_heads,
-            n_encoder_layers=self.cfg.n_encoder_layers,
-            dropout=self.cfg.dropout,
-            use_attention=self.cfg.use_attention,
-            clip_logits=self.cfg.clip_logits,
-        )
-        self.network = PolicyNetwork(net_cfg)
-
-        self.network.to(self.cfg.device)
-        self.optimizer = optim.Adam(self.network.parameters(), lr=self.cfg.lr)
-        self.lr_scheduler = optim.lr_scheduler.LambdaLR(
-            self.optimizer, lr_lambda=lambda _: 1.0
-        )
+        self.optimizer = optim.Adam(self.network.parameters(), lr=cfg.lr)
 
         self.rollout_buffer = RolloutBuffer(
-            capacity=self.cfg.rollout_len,
+            capacity=cfg.rollout_len,
             obs_shape=obs_shape,
             action_space_size=action_space_size,
-            gamma=self.cfg.gamma,
-            gae_lambda=self.cfg.gae_lambda,
+            gamma=cfg.gamma,
+            gae_lambda=cfg.gae_lambda,
         )
+        self.rollout_buffer.normalize_advantages_flag = cfg.normalize_advantages
 
-        # Running reward normalizer
-        self._reward_mean = 0.0
-        self._reward_var = 1.0
-        self._reward_count = 0
+        self.reward_normalizer = RunningNormalizer() if cfg.normalize_rewards else None
 
-        # Metrics
         self._update_count = 0
-        self.metrics_log: List[Dict[str, float]] = []
+        self._step_count = 0
 
     # ------------------------------------------------------------------
-    # Action selection
+    # Helpers — obs conversion
+    # ------------------------------------------------------------------
+
+    def _to_tensor_obs(self, obs: Union[np.ndarray, Dict]) -> Any:
+        """
+        Convert obs (array or dict) to the format the network expects.
+        - array: (B, *obs_shape) FloatTensor
+        - dict:  {key: (B, ...) FloatTensor}  — vehicle_features come from
+                 obs dict directly or from the rollout buffer extra arrays.
+        """
+        if isinstance(obs, dict):
+            return {k: torch.FloatTensor(v).to(self.device) for k, v in obs.items()}
+        return torch.FloatTensor(obs).to(self.device)
+
+    def _batch_obs(self, obs: Union[np.ndarray, Dict]) -> Any:
+        """Add batch dimension (B=1) to obs."""
+        if isinstance(obs, dict):
+            return {k: v[None] for k, v in obs.items()}
+        return obs[None]
+
+    # ------------------------------------------------------------------
+    # Inference
     # ------------------------------------------------------------------
 
     def select_action(
         self,
-        obs: np.ndarray,
+        obs: Union[np.ndarray, Dict],
         action_mask: np.ndarray,
         training: bool = True,
     ) -> Tuple[int, float, float]:
-        """
-        Sample (or greedily pick) an action.
-
-        Args:
-            obs:         Observation array, shape obs_shape.
-            action_mask: Boolean array, shape (action_space_size,).
-            training:    If False, use deterministic greedy decoding.
-
-        Returns:
-            action:   Integer action index.
-            log_prob: Log-probability of the chosen action.
-            value:    Critic's value estimate.
-        """
-        self.network.eval()
         with torch.no_grad():
-            obs_t = torch.FloatTensor(obs).unsqueeze(0).to(self.cfg.device)
-            mask_t = torch.BoolTensor(action_mask).unsqueeze(0).to(self.cfg.device)
+            obs_t = self._to_tensor_obs(self._batch_obs(obs))
+            mask_t = torch.BoolTensor(action_mask).unsqueeze(0).to(self.device)
             action_t, lp_t, val_t = self.network.get_action_and_log_prob(
                 obs_t, mask_t, deterministic=not training
             )
-        action = int(action_t.item())
-        log_prob = float(lp_t.item())
-        value = float(val_t.item())
-
-        return action, log_prob, value
+        return int(action_t.item()), float(lp_t.item()), float(val_t.item())
 
     # ------------------------------------------------------------------
-    # Rollout collection
+    # Experience collection
     # ------------------------------------------------------------------
 
-    def collect_rollout(self, env, instance_generator) -> Dict[str, float]:
-        """
-        Collect a full rollout of ``cfg.rollout_len`` steps.
-
-        Args:
-            env:                CombinatorialEnv instance.
-            instance_generator: Callable[] → raw_instance; called per episode.
-
-        Returns:
-            Rollout statistics (mean reward, mean episode length, …).
-        """
-        self.network.train()
+    def collect(self, env: Any, instance_generator: Callable) -> Dict[str, float]:
         self.rollout_buffer.reset()
 
-        episode_rewards: List[float] = []
-        episode_lengths: List[int] = []
-        ep_reward = 0.0
-        ep_length = 0
+        ep_rewards: List[float] = []
+        ep_lengths: List[int] = []
+        ep_reward, ep_length = 0.0, 0
 
-        raw_instance = instance_generator()
-        obs, info = env.reset(raw_instance)
+        raw = instance_generator()
+        obs, info = env.reset(raw)
         action_mask = info["action_mask"]
 
-        steps_collected = 0
         while not self.rollout_buffer.is_full:
             action, log_prob, value = self.select_action(
                 obs, action_mask, training=True
             )
             next_obs, reward, terminated, truncated, info = env.step(action)
 
-            if self.cfg.normalize_rewards:
-                reward = self._normalize_reward(reward)
+            if self.reward_normalizer is not None:
+                reward = self.reward_normalizer.normalise(reward)
+
+            # For dict obs (VRPBTW), store node_features as primary obs
+            # and vehicle_features separately for the HACN decoder context
+            if isinstance(obs, dict):
+                obs_to_store = obs["node_features"]
+                veh_to_store = obs["vehicle_features"]
+            else:
+                obs_to_store = obs
+                veh_to_store = None
 
             self.rollout_buffer.add(
-                obs=obs,
+                obs=obs_to_store,
                 action=action,
                 reward=reward,
-                done=terminated or truncated,
+                done=(terminated or truncated),
                 log_prob=log_prob,
                 value=value,
                 action_mask=action_mask,
+                vehicle_features=veh_to_store,
             )
 
+            self._step_count += 1
             ep_reward += reward
             ep_length += 1
-            steps_collected += 1
-
             obs = next_obs
             action_mask = info["action_mask"]
 
             if terminated or truncated:
-                episode_rewards.append(ep_reward)
-                episode_lengths.append(ep_length)
-                ep_reward = 0.0
-                ep_length = 0
-                raw_instance = instance_generator()
-                obs, info = env.reset(raw_instance)
+                ep_rewards.append(ep_reward)
+                ep_lengths.append(ep_length)
+                ep_reward, ep_length = 0.0, 0
+                raw = instance_generator()
+                obs, info = env.reset(raw)
                 action_mask = info["action_mask"]
 
-        # Bootstrap last value
+        # Bootstrap value for GAE
         _, _, last_value = self.select_action(obs, action_mask, training=False)
-        self.rollout_buffer.compute_returns(last_value=last_value)
+        self.rollout_buffer.compute_returns_and_advantages(last_value=last_value)
 
-        stats = {
-            "rollout/mean_reward": float(np.mean(episode_rewards))
-            if episode_rewards
-            else 0.0,
-            "rollout/mean_ep_length": float(np.mean(episode_lengths))
-            if episode_lengths
-            else 0.0,
-            "rollout/n_episodes": len(episode_rewards),
-            "rollout/steps_collected": steps_collected,
+        return {
+            "rollout/mean_reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
+            "rollout/mean_ep_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
+            "rollout/n_episodes": len(ep_rewards),
+            "rollout/steps": self.rollout_buffer.capacity,
         }
-        return stats
 
     # ------------------------------------------------------------------
-    # PPO update
+    # Learning update
     # ------------------------------------------------------------------
 
-    def update(self) -> Dict[str, float]:
-        """
-        Run ``cfg.n_epochs`` of PPO updates on the current rollout buffer.
-
-        Returns metrics dict with policy/value/entropy losses and KL.
-        """
-
-        self.network.train()
-        cfg = self.cfg
-
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
-        total_entropy_loss = 0.0
-        total_kl = 0.0
-        n_updates = 0
-        early_stop = False
-
-        for batch in self.rollout_buffer.iter_batches(
-            cfg.mini_batch_size, n_epochs=cfg.n_epochs
-        ):
-            if early_stop:
-                break
-
-            obs_t = torch.FloatTensor(batch.obs).to(cfg.device)
-            acts_t = torch.LongTensor(batch.actions).to(cfg.device)
-            masks_t = torch.BoolTensor(batch.action_masks).to(cfg.device)
-            adv_t = torch.FloatTensor(batch.advantages).to(cfg.device)
-            ret_t = torch.FloatTensor(batch.returns).to(cfg.device)
-            old_lp_t = torch.FloatTensor(batch.log_probs).to(cfg.device)
-
-            new_lp, values, entropy = self.network.evaluate_actions(
-                obs_t, acts_t, masks_t
-            )
-
-            # Clipped surrogate loss
-            ratio = torch.exp(new_lp - old_lp_t)
-            surr1 = ratio * adv_t
-            surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_t
-            policy_loss = -torch.min(surr1, surr2).mean()
-
-            # Value loss (clipped)
-            value_loss = 0.5 * F.mse_loss(values, ret_t)
-
-            # Entropy bonus
-            entropy_loss = -entropy.mean()
-
-            loss = (
-                policy_loss
-                + cfg.value_coef * value_loss
-                + cfg.entropy_coef * entropy_loss
-            )
-
-            self.optimizer.zero_grad()
-            loss.backward()
-            nn.utils.clip_grad_norm_(self.network.parameters(), cfg.max_grad_norm)
-            self.optimizer.step()
-
-            # Approximate KL for early stopping
-            with torch.no_grad():
-                approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
-
-            total_policy_loss += policy_loss.item()
-            total_value_loss += value_loss.item()
-            total_entropy_loss += entropy_loss.item()
-            total_kl += approx_kl
-            n_updates += 1
-
-            if cfg.target_kl is not None and approx_kl > 1.5 * cfg.target_kl:
-                early_stop = True
-
+    def update(self) -> Optional[Dict[str, float]]:
+        self.network.train()  # set training mode once, right here
+        metrics = ppo_update(
+            network=self.network,
+            optimizer=self.optimizer,
+            buffer=self.rollout_buffer,
+            cfg=self.cfg,
+            device=self.device,
+        )
         self._update_count += 1
-        n = max(n_updates, 1)
-        metrics = {
-            "train/policy_loss": total_policy_loss / n,
-            "train/value_loss": total_value_loss / n,
-            "train/entropy": -total_entropy_loss / n,
-            "train/approx_kl": total_kl / n,
-            "train/update_count": self._update_count,
-            "train/early_stop": float(early_stop),
-        }
-        self.metrics_log.append(metrics)
+        metrics["train/update_count"] = self._update_count
         return metrics
 
     # ------------------------------------------------------------------
-    # Reward normalisation (running Welford)
+    # Persistence
     # ------------------------------------------------------------------
 
-    def _normalize_reward(self, reward: float) -> float:
-        self._reward_count += 1
-        delta = reward - self._reward_mean
-        self._reward_mean += delta / self._reward_count
-        self._reward_var += delta * (reward - self._reward_mean)
-        std = max(math.sqrt(self._reward_var / max(self._reward_count - 1, 1)), 1e-8)
-        return reward / std
-
-    # ------------------------------------------------------------------
-    # Checkpoint save / load
-    # ------------------------------------------------------------------
-
-    def save(self, path: str) -> None:
-        """Persist network weights and optimiser state."""
-        file_path = Path(path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "network": self.network.state_dict(),
-                "optimizer": self.optimizer.state_dict(),
-                "update_count": self._update_count,
-                "reward_mean": self._reward_mean,
-                "reward_var": self._reward_var,
-                "reward_count": self._reward_count,
-            },
-            path,
-        )
+    def save(self, path: str, extra: Optional[Dict] = None) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "network_state": self.network.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "ppo_cfg": dataclasses.asdict(self.cfg),
+            "obs_shape": self.obs_shape,
+            "action_space_size": self.action_space_size,
+            "update_count": self._update_count,
+            "step_count": self._step_count,
+            "reward_norm": (
+                self.reward_normalizer.state_dict() if self.reward_normalizer else None
+            ),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
 
     def load(self, path: str) -> None:
-        """Restore network and optimiser from checkpoint."""
-        file_path = Path(path)
-        ckpt = torch.load(file_path, map_location=self.cfg.device)
-        self.network.load_state_dict(ckpt["network"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        ckpt = torch.load(path, map_location=self.device)
+        self.network.load_state_dict(ckpt["network_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
         self._update_count = ckpt.get("update_count", 0)
-        self._reward_mean = ckpt.get("reward_mean", 0.0)
-        self._reward_var = ckpt.get("reward_var", 1.0)
-        self._reward_count = ckpt.get("reward_count", 0)
+        self._step_count = ckpt.get("step_count", 0)
+        if self.reward_normalizer and ckpt.get("reward_norm"):
+            self.reward_normalizer.load_state_dict(ckpt["reward_norm"])
 
     def __repr__(self) -> str:
         return (
-            f"PPOAgent(obs={self.obs_shape}, "
-            f"actions={self.action_space_size}, "
-            f"updates={self._update_count})"
+            f"PPOAgent(obs={self.obs_shape}, actions={self.action_space_size}, "
+            f"updates={self._update_count}, device={self.device!r})"
         )

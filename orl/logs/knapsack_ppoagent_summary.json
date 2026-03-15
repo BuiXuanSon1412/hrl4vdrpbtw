@@ -1,7 +1,0 @@
-{
-  "stop_reason": "timestep_limit",
-  "total_iterations": 59,
-  "total_timesteps": 30208,
-  "best_objective": 75.73070831298828,
-  "training_time_s": 17.4
-}

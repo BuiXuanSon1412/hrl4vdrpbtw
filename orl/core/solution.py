@@ -6,30 +6,13 @@ Container for a decoded combinatorial solution with metadata.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
-import time
 
 
 @dataclass
 class Solution:
-    """
-    A decoded, human-interpretable solution to a combinatorial problem.
-
-    Attributes
-    ----------
-    problem_name : str
-        Name of the problem class this solution belongs to.
-    raw_state : Any
-        The terminal MDP state from which the solution was decoded.
-    objective : float
-        Scalar objective value (higher = better).
-    decision_sequence : List[int]
-        Ordered list of actions taken to construct the solution.
-    metadata : dict
-        Arbitrary extra information (time taken, instance id, …).
-    """
-
     problem_name: str
     raw_state: Any
     objective: float
@@ -37,32 +20,19 @@ class Solution:
     metadata: Dict[str, Any] = field(default_factory=dict)
     timestamp: float = field(default_factory=time.time)
 
-    # ------------------------------------------------------------------
-    # Comparison
-    # ------------------------------------------------------------------
-
     def __lt__(self, other: "Solution") -> bool:
         return self.objective < other.objective
-
-    def __le__(self, other: "Solution") -> bool:
-        return self.objective <= other.objective
-
-    def __gt__(self, other: "Solution") -> bool:
-        return self.objective > other.objective
 
     def is_better_than(
         self, other: Optional["Solution"], minimise: bool = False
     ) -> bool:
-        """Return True if self is a better solution than other."""
         if other is None:
             return True
-        if minimise:
-            return self.objective < other.objective
-        return self.objective > other.objective
-
-    # ------------------------------------------------------------------
-    # Display
-    # ------------------------------------------------------------------
+        return (
+            self.objective < other.objective
+            if minimise
+            else self.objective > other.objective
+        )
 
     def summary(self) -> str:
         lines = [
@@ -86,19 +56,13 @@ class Solution:
 
 @dataclass
 class SolutionPool:
-    """
-    Maintains a fixed-capacity pool of the best solutions found so far,
-    useful for population-based or beam-search decoding.
-    """
+    """Fixed-capacity pool of best solutions found so far."""
 
     capacity: int = 10
     minimise: bool = False
     _solutions: List[Solution] = field(default_factory=list, init=False)
 
     def add(self, sol: Solution) -> bool:
-        """
-        Add a solution; returns True if it was inserted into the pool.
-        """
         self._solutions.append(sol)
         self._solutions.sort(reverse=not self.minimise, key=lambda s: s.objective)
         if len(self._solutions) > self.capacity:

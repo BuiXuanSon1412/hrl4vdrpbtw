@@ -11,7 +11,7 @@ A reusable, end-to-end Reinforcement Learning framework that covers
 rl_combinatorial/
 │
 ├── core/
-│   ├── problem.py          ← Abstract CombinatorialProblem (MDP definition)
+│   ├── problem.py          ← Abstract Problem (MDP definition)
 │   ├── solution.py         ← Solution + SolutionPool containers
 │   └── buffers.py          ← ReplayBuffer, PrioritizedReplayBuffer, RolloutBuffer
 │
@@ -33,7 +33,7 @@ rl_combinatorial/
 │   └── helpers.py          ← MetricsTracker, EpsilonScheduler, LRScheduler, …
 │
 └── examples/
-    ├── knapsack_problem.py ← Concrete CombinatorialProblem implementation (0/1 Knapsack)
+    ├── knapsack_problem.py ← Concrete Problem implementation (0/1 Knapsack)
     └── train_knapsack.py   ← Full training script demonstrating all stages
 ```
 
@@ -62,9 +62,9 @@ rl_combinatorial/
 ### 1. Define your problem (one class, ~7 methods)
 
 ```python
-from core.problem import CombinatorialProblem, ActionMask, StepResult
+from core.problem import Problem, ActionMask, StepResult
 
-class MyProblem(CombinatorialProblem):
+class MyProblem(Problem):
     def encode_instance(self, raw):   ...  # parse input
     def initial_state(self):          ...  # empty solution
     def get_action_mask(self, state): ...  # feasibility

@@ -1,3 +1,3 @@
-from .combinatorial_env import CombinatorialEnv
+from .combinatorial_env import Env
 
-__all__ = ["CombinatorialEnv"]
+__all__ = ["Env"]

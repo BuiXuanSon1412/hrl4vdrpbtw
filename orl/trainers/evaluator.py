@@ -16,7 +16,7 @@ import numpy as np
 from agents.ppo_agent import PPOAgent
 from agents.dqn_agent import DQNAgent
 from core.solution import Solution, SolutionPool
-from environments.combinatorial_env import CombinatorialEnv
+from environments.combinatorial_env import Env
 
 Agent = Union[PPOAgent, DQNAgent]
 
@@ -33,7 +33,7 @@ class Evaluator:
     Parameters
     ----------
     agent         : Trained PPOAgent or DQNAgent.
-    env           : CombinatorialEnv wrapping the problem.
+    env           : Env wrapping the problem.
     n_episodes    : Number of fresh instances to evaluate on.
     deterministic : True → greedy decoding; False → stochastic.
     n_samples     : For sampling decoding: rollouts per instance.
@@ -43,7 +43,7 @@ class Evaluator:
     def __init__(
         self,
         agent: Agent,
-        env: CombinatorialEnv,
+        env: Env,
         n_episodes: int = 20,
         deterministic: bool = True,
         n_samples: int = 1,
