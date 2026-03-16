@@ -34,6 +34,45 @@ from networks.base_network import BaseNetwork
 from utils.normalizer import RunningNormalizer
 
 
+# ---------------------------------------------------------------------------
+# Padding helpers for variable-size curriculum instances
+# ---------------------------------------------------------------------------
+
+
+def _pad_to(arr: np.ndarray, target_shape: tuple) -> np.ndarray:
+    """
+    Zero-pad arr to target_shape along the first axis.
+
+    Used when curriculum generates N_small < N_max nodes so that
+    node_features (N_small+1, feat_dim) fits into a buffer slot
+    pre-allocated for (N_max+1, feat_dim).
+
+    Padding rows are all zeros — the served flag (col 7) is 0, which the
+    network interprets as unserved, but padded rows are also masked out
+    in the action mask so they are never selected.
+    """
+    if arr.shape == target_shape:
+        return arr
+    out = np.zeros(target_shape, dtype=arr.dtype)
+    slices = tuple(slice(0, s) for s in arr.shape)
+    out[slices] = arr
+    return out
+
+
+def _pad_mask(mask: np.ndarray, target_size: int) -> np.ndarray:
+    """
+    Zero-pad a boolean action mask to target_size.
+
+    Padded entries are False (infeasible) — correct because those
+    (fleet, vehicle, node) combinations do not exist for smaller instances.
+    """
+    if mask.shape[0] == target_size:
+        return mask
+    out = np.zeros(target_size, dtype=bool)
+    out[: mask.shape[0]] = mask
+    return out
+
+
 class PPOAgent(BaseAgent):
     def __init__(
         self,
@@ -129,13 +168,18 @@ class PPOAgent(BaseAgent):
                 reward = self.reward_normalizer.normalise(reward)
 
             # For dict obs (VRPBTW), store node_features as primary obs
-            # and vehicle_features separately for the HACN decoder context
+            # and vehicle_features separately for the HACN decoder context.
+            # Pad to buffer's pre-allocated shapes when curriculum generates
+            # smaller instances than the maximum problem size.
             if isinstance(obs, dict):
-                obs_to_store = obs["node_features"]
-                veh_to_store = obs["vehicle_features"]
+                obs_to_store = _pad_to(obs["node_features"], self.obs_shape)
+                veh_to_store = obs["vehicle_features"]  # (2K, 7) — fixed size
             else:
                 obs_to_store = obs
                 veh_to_store = None
+
+            # Pad action_mask to buffer's action_space_size
+            mask_to_store = _pad_mask(action_mask, self.action_space_size)
 
             self.rollout_buffer.add(
                 obs=obs_to_store,
@@ -144,7 +188,7 @@ class PPOAgent(BaseAgent):
                 done=(terminated or truncated),
                 log_prob=log_prob,
                 value=value,
-                action_mask=action_mask,
+                action_mask=mask_to_store,
                 vehicle_features=veh_to_store,
             )
 

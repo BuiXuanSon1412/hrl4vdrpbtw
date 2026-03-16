@@ -249,14 +249,12 @@ class HACNNetwork(BaseNetwork):
     def __init__(
         self,
         obs_shape: Tuple[int, ...],
-        action_space_size: int,
         n_vehicles: int,
         cfg: NetworkConfig,
     ):
         super().__init__()
         self.cfg = cfg
         self.obs_shape = obs_shape
-        self.action_space_size = action_space_size
         self.n_vehicles = n_vehicles  # 2K
 
         N1 = obs_shape[0]  # N+1 nodes
@@ -337,7 +335,9 @@ class HACNNetwork(BaseNetwork):
         graph_emb: torch.Tensor,  # (B, D)
         static_emb: torch.Tensor,  # (B, N+1, D)
         veh_emb: torch.Tensor,  # (B, 2K, D)
-        node_mask: torch.Tensor,  # (B, N+1) bool  True=feasible
+        node_mask: Optional[
+            torch.Tensor
+        ],  # (B, N+1) bool True=feasible; None=all feasible
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns
@@ -378,7 +378,9 @@ class HACNNetwork(BaseNetwork):
         dist_to_node: torch.Tensor,  # (B, 2K)  travel distance
         arrival_time: torch.Tensor,  # (B, 2K)  estimated arrival
         tardiness: torch.Tensor,  # (B, 2K)  tardiness if assigned
-        veh_mask: torch.Tensor,  # (B, 2K)  bool True=feasible
+        veh_mask: Optional[
+            torch.Tensor
+        ],  # (B, 2K)  bool True=feasible; None=all feasible
     ) -> torch.Tensor:
         """
         Returns

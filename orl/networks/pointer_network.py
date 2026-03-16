@@ -96,11 +96,9 @@ class PointerNetwork(BaseNetwork):
     def __init__(
         self,
         feat_dim: int,
-        max_nodes: int,
         cfg: NetworkConfig,
     ):
         super().__init__()
-        self.max_nodes = max_nodes
         self.cfg = cfg
         D = cfg.embed_dim
 

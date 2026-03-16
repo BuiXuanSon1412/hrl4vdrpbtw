@@ -210,10 +210,16 @@ def config_from_dict(d: Dict, cls) -> Any:
     hints = typing.get_type_hints(cls)
     kwargs = {}
     for f in dataclasses.fields(cls):
-        val = d.get(
-            f.name,
-            f.default if f.default is not dataclasses.MISSING else f.default_factory(),
-        )
+        if f.name in d:
+            val = d[f.name]
+        elif f.default is not dataclasses.MISSING:
+            val = f.default
+        elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
+            val = f.default_factory()  # type: ignore[misc]
+        else:
+            raise ValueError(
+                f"No value or default for field {f.name!r} in {cls.__name__}"
+            )
         actual_type = hints.get(f.name, None)
         if (
             actual_type

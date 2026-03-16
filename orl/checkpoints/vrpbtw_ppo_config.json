@@ -18,13 +18,14 @@
     "dense_shaping": true
   },
   "network": {
-    "network_type": "pointer",
+    "network_type": "hacn",
     "embed_dim": 128,
     "n_heads": 8,
     "n_encoder_layers": 3,
     "dropout": 0.0,
     "clip_logits": 10.0,
     "ortho_init": true,
+    "use_instance_norm": true,
     "hidden_dims": [
       256,
       256

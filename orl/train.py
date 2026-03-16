@@ -160,7 +160,10 @@ def main() -> None:
     # Algorithm & network
     parser.add_argument("--algorithm", type=str, default=None, choices=["ppo", "dqn"])
     parser.add_argument(
-        "--network", type=str, default=None, choices=["attention", "pointer", "mlp"]
+        "--network",
+        type=str,
+        default=None,
+        choices=["attention", "pointer", "mlp", "hacn"],
     )
     parser.add_argument("--embed-dim", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
