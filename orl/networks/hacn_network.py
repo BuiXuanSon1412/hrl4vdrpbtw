@@ -240,22 +240,22 @@ class HACNNetwork(BaseNetwork):
 
     Parameters
     ----------
-    obs_shape        : (N+1, NODE_FEAT_DIM) from problem.observation_shape
-    action_space_size: K * 2 * (N+1)        from problem.action_space_size
-    n_vehicles       : 2 * K                from problem.n_vehicles
-    cfg              : NetworkConfig
+    obs_shape : (N+1, NODE_FEAT_DIM) from problem.observation_shape.
+                The network infers all other sizes (N+1, 2K, feat_dim)
+                from input tensors at forward time — no problem-size
+                constants are stored on the network.
+    cfg       : NetworkConfig
     """
 
     def __init__(
         self,
         obs_shape: Tuple[int, ...],
-        n_vehicles: int,
         cfg: NetworkConfig,
     ):
         super().__init__()
         self.cfg = cfg
         self.obs_shape = obs_shape
-        self.n_vehicles = n_vehicles  # 2K
+        # n_vehicles (2K) is inferred from vehicle_features.shape[1] at forward time
 
         N1 = obs_shape[0]  # N+1 nodes
         feat_dim = obs_shape[1]  # NODE_FEAT_DIM = 9
