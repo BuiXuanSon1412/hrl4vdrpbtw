@@ -5,13 +5,10 @@ Gym-style MDP wrapper for any Problem.
 
 Changes vs original
 --------------------
-- state_to_obs now returns either a numpy array (Knapsack) or a dict
-  (VRPBTW). The env handles both transparently.
-- _make_info exposes dynamic decoder context fields when obs is a dict:
-    "node_features"    : (N+1, NODE_FEAT_DIM)
-    "vehicle_features" : (2K, VEH_FEAT_DIM)
-  These are consumed by PPOAgent.collect() and passed to the network.
-- step() guard updated to check both _state and _current_mask.
+- _make_info() now exposes graph fields when obs is a dict with graph keys:
+    "edge_index", "edge_attr", "edge_fleet"
+  These are consumed by PPOAgent.collect() and stored in RolloutBuffer.
+- Everything else unchanged.
 """
 
 from __future__ import annotations
@@ -31,7 +28,7 @@ class Env:
 
         self._state: Any = None
         self._current_mask: Optional[ActionMask] = None
-        self._current_obs: Any = None  # array or dict
+        self._current_obs: Any = None
         self._step_count: int = 0
         self._episode_reward: float = 0.0
         self._decision_sequence: List[int] = []
@@ -112,7 +109,7 @@ class Env:
         return raw * self.cfg.reward_scale
 
     # ------------------------------------------------------------------
-    # Info dict — exposes dynamic decoder context when obs is a dict
+    # Info dict
     # ------------------------------------------------------------------
 
     def _make_info(self) -> Dict:
@@ -121,10 +118,18 @@ class Env:
             "feasible_actions": self._current_mask.action_indices,
             "step": self._step_count,
         }
-        # Expose vehicle features for HACN decoder context
+
         if isinstance(self._current_obs, dict):
+            # always expose node/vehicle features for HACN
             info["node_features"] = self._current_obs["node_features"]
             info["vehicle_features"] = self._current_obs["vehicle_features"]
+
+            # expose graph fields when present (VRPBTW)
+            if "edge_index" in self._current_obs:
+                info["edge_index"] = self._current_obs["edge_index"]
+                info["edge_attr"] = self._current_obs["edge_attr"]
+                info["edge_fleet"] = self._current_obs["edge_fleet"]
+
         return info
 
     # ------------------------------------------------------------------

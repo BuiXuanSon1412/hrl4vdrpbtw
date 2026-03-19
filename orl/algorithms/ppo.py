@@ -3,25 +3,23 @@ algorithms/ppo.py
 -----------------
 PPO-clip algorithm: pure compute, no state, no env, no agent coupling.
 
-This module contains ONLY the mathematical operations of the PPO update.
-It is a stateless function, not a class.  The PPOAgent owns optimizer,
-buffer, and network; it calls ppo_update() to do the math.
-
-Separating algorithm math from agent state is the standard research-lab
-pattern (see CleanRL, Stable Baselines 3, RLlib).  It makes:
-  - unit-testing the algorithm trivial (no env needed)
-  - swapping PPO for another on-policy algo a one-line change in the agent
-
-Fixes vs original
------------------
-- explained_variance is now logged (key PPO diagnostic)
-- gradient norm is logged BEFORE clipping (shows if clipping is active)
-- KL approximation uses the numerically stable formula
+Changes vs original
+-------------------
+- _build_obs(): new helper that reconstructs the full obs dict from a batch,
+  including graph fields from batch.graph_data when present.
+  For VRPBTW: obs = {
+      "node_features":    (B, N+1, D)   from batch.obs
+      "vehicle_features": (B, 2K, Dv)   from batch.vehicle_features
+      "edge_index":       list[B] of (2, E_b)   from batch.graph_data
+      "edge_attr":        list[B] of (E_b, 6)
+      "edge_fleet":       list[B] of (E_b,)
+  }
+  For flat obs (Knapsack): obs = batch.obs tensor directly.
 """
 
 from __future__ import annotations
 
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
@@ -30,7 +28,57 @@ import torch.nn.functional as F
 
 from configs import PPOConfig
 from networks.base_network import BaseNetwork
-from buffers import RolloutBuffer
+from buffers import RolloutBuffer, Batch
+
+
+# ---------------------------------------------------------------------------
+# Obs reconstruction helper
+# ---------------------------------------------------------------------------
+
+
+def _build_obs(batch: Batch, device: str) -> Union[torch.Tensor, Dict]:
+    """
+    Reconstruct the obs format the network expects from a stored batch.
+
+    - Flat obs (no vehicle_features, no graph_data): return FloatTensor
+    - Dict obs without graph: {"node_features", "vehicle_features"}
+    - Dict obs with graph:    {"node_features", "vehicle_features",
+                                "edge_index", "edge_attr", "edge_fleet"}
+      graph fields stay as Python lists of numpy arrays — the network's
+      _prep_batch() handles list-of-arrays correctly.
+    """
+    if batch.vehicle_features is None and batch.graph_data is None:
+        # plain flat obs (Knapsack)
+        return torch.FloatTensor(batch.obs).to(device)
+
+    obs: Dict = {
+        "node_features": torch.FloatTensor(batch.obs).to(device),
+    }
+
+    if batch.vehicle_features is not None:
+        obs["vehicle_features"] = torch.FloatTensor(batch.vehicle_features).to(device)
+
+    if batch.graph_data is not None:
+        # keep as list — network's _prep_batch handles it
+        obs["edge_index"] = [
+            (gd["edge_index"] if gd is not None else np.zeros((2, 0), dtype=np.int32))
+            for gd in batch.graph_data
+        ]
+        obs["edge_attr"] = [
+            (gd["edge_attr"] if gd is not None else np.zeros((0, 6), dtype=np.float32))
+            for gd in batch.graph_data
+        ]
+        obs["edge_fleet"] = [
+            (gd["edge_fleet"] if gd is not None else np.zeros(0, dtype=np.int32))
+            for gd in batch.graph_data
+        ]
+
+    return obs
+
+
+# ---------------------------------------------------------------------------
+# PPO update
+# ---------------------------------------------------------------------------
 
 
 def ppo_update(
@@ -42,18 +90,6 @@ def ppo_update(
 ) -> Dict[str, float]:
     """
     Run cfg.n_epochs of PPO-clip updates on the current rollout buffer.
-
-    Parameters
-    ----------
-    network   : Policy + value network (modified in-place).
-    optimizer : Adam / etc. for the network.
-    buffer    : Filled RolloutBuffer with returns already computed.
-    cfg       : PPOConfig.
-    device    : "cpu" or "cuda".
-
-    Returns
-    -------
-    metrics : Dict of aggregated training metrics for logging.
     """
     network.train()
 
@@ -72,18 +108,7 @@ def ppo_update(
         if early_stop:
             break
 
-        # Reconstruct dict obs for HACN when vehicle_features are stored
-        if batch.vehicle_features is not None:
-            obs_t = {
-                "node_features": torch.FloatTensor(batch.obs).to(device),
-                "vehicle_features": torch.FloatTensor(batch.vehicle_features).to(
-                    device
-                ),
-            }
-        elif isinstance(batch.obs, dict):
-            obs_t = {k: torch.FloatTensor(v).to(device) for k, v in batch.obs.items()}
-        else:
-            obs_t = torch.FloatTensor(batch.obs).to(device)
+        obs_t = _build_obs(batch, device)
         acts_t = torch.LongTensor(batch.actions).to(device)
         masks_t = torch.BoolTensor(batch.action_masks).to(device)
         adv_t = torch.FloatTensor(batch.advantages).to(device)
@@ -92,16 +117,13 @@ def ppo_update(
 
         new_lp, values, entropy = network.evaluate_actions(obs_t, acts_t, masks_t)
 
-        # Clipped surrogate objective
+        # clipped surrogate objective
         ratio = torch.exp(new_lp - old_lp_t)
         surr1 = ratio * adv_t
         surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_t
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Value loss
         value_loss = 0.5 * F.mse_loss(values, ret_t)
-
-        # Entropy bonus
         entropy_loss = -entropy.mean()
 
         loss = (
@@ -110,13 +132,9 @@ def ppo_update(
 
         optimizer.zero_grad()
         loss.backward()
-
-        # Log gradient norm BEFORE clipping
         grad_norm = nn.utils.clip_grad_norm_(network.parameters(), cfg.max_grad_norm)
-
         optimizer.step()
 
-        # Approximate KL  (numerically stable formula)
         with torch.no_grad():
             approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
 
@@ -130,9 +148,7 @@ def ppo_update(
         if cfg.target_kl is not None and approx_kl > 1.5 * cfg.target_kl:
             early_stop = True
 
-    # Explained variance (key PPO diagnostic: should trend toward 1.0)
-    # Computed from the full buffer — not from the last mini-batch — to avoid
-    # the "batch possibly unbound" error and to get a more stable estimate.
+    # explained variance from full buffer
     n_steps = buffer._ptr
     if n_steps > 0:
         y_true = buffer._returns[:n_steps]

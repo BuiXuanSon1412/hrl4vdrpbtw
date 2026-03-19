@@ -1,49 +1,67 @@
 """
 networks/hacn_network.py
 ------------------------
-Heterogeneous Attention Construction Network (HACN)
-for VRPBTW with truck-drone fleets.
+Heterogeneous Attention Construction Network (HACN) for VRPBTW.
 
 Architecture
-------------
-Encoder  — Two-stage attention (Wang et al. 2024)
-  Stage 1: Multi-head self-attention over ALL nodes
-           captures global spatial relationships
-  Stage 2: Heterogeneous cross-attention
-           linehaul nodes query backhaul embeddings  (and vice versa)
-           explicitly models the linehaul/backhaul dependency
-  Per block: skip + InstanceNorm + FF + InstanceNorm
-  Runs ONCE per instance; static embeddings are cached.
+────────────
+ENCODER  (runs once per instance, output Z_node cached)
+  Node features (N+1, NODE_FEAT_DIM)
+  → MLP projection
+  → L × [Self-attention + Heterogeneous cross-attention (linehaul↔backhaul)
+          + FF + InstanceNorm]
+  → Z_node: (N+1, D)
 
-Decoder  — Hierarchical, two-level  (simultaneous multi-route)
-  Level 1 (Node Selector):
-    Context = graph_mean + fleet_summary (all vehicles via attention)
-    Pointer attention over node embeddings → node_logits (N+1,)
-    Node-level mask: a node is feasible if ANY vehicle can serve it
+VEHICLE GNN  (re-runs every step on dynamic partial-solution graph G_t)
+  Graph G_t nodes  = visited nodes, features:
+      Z_node[v]              (D,)   cached encoder output
+      visit_time[v]/T_max    (1,)
+      visiting_fleet[v]      (K,)   one-hot
+      visiting_vehicle[v]    (1,)   0=truck 1=drone
+  Graph G_t edges  (E, EDGE_FEAT_DIM=6):
+      [edge_type, travel_time, travel_dist, depart_time, arrive_time, tardiness]
+  → L' × edge-conditioned message passing
+  → Z_graph: (|V_t|, D)
 
-  Level 2 (Vehicle Selector):
-    Given selected node, score each vehicle
-    Context per vehicle = [vehicle_emb_k ; target_node_emb ;
-                           dist_to_node ; arrival_time ; tardiness_if_assigned]
-    Vehicle-level mask: vehicle-specific feasibility
+  Vehicle readout:
+    base[k,type]  = Z_graph[current_node(k,type)]   (or zeros if graph empty)
+    props[k,type] = MLP(vehicle_feature_row)         (D,)
+    Z_veh[v]      = base[v] + props[v]               (D,)   shape (2K, D)
 
-Joint log-prob (PPO compatible)
-  log_prob = log_prob_L1(node) + log_prob_L2(vehicle | node)
+HIERARCHICAL DECODER  (runs every step)
+  graph_node = mean_pool(Z_node)     (D,)
+  graph_veh  = mean_pool(Z_veh)      (D,)
+
+  Upper policy (node selection):
+    context_U = MLP([graph_node ; graph_veh])   (D,)
+    score[i]  = clip · tanh(dot(W_q·context_U, W_k·Z_node[i]) / sqrt(D))
+    → masked softmax → node n*
+
+  Lower policy (vehicle selection):
+    context_L = MLP([graph_veh ; Z_node[n*]])   (D,)
+    score[v]  = MLP([Z_veh[v] ; context_L])     scalar
+    → masked softmax → vehicle v*
+
+  Joint log-prob = log π_U(n*) + log π_L(v* | n*)
 
 Observation contract
---------------------
-  obs["node_features"]    : (B, N+1, NODE_FEAT_DIM=9)  — encoder input
-  obs["vehicle_features"] : (B, 2K,  VEH_FEAT_DIM=7)   — decoder context
+────────────────────
+  obs["node_features"]    : (B, N+1, NODE_FEAT_DIM)
+  obs["vehicle_features"] : (B, 2K,  VEH_FEAT_DIM)
+  obs["edge_index"]       : list[B] of (2, E_b)  int   (variable per sample)
+  obs["edge_attr"]        : list[B] of (E_b, 6)  float
+  obs["edge_fleet"]       : list[B] of (E_b,)    int
 
-Action encoding (matches environment)
-  flat = fleet * 2*(N+1) + vehicle_type * (N+1) + node
-  vehicle_index = fleet * 2 + vehicle_type  (0=truck, 1=drone per fleet)
+Action encoding
+────────────────
+  flat = node * 2K + vehicle_idx
+  Matches VRPBTWProblem.encode_action / decode_action
 """
 
 from __future__ import annotations
 
 import math
-from typing import Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -52,50 +70,34 @@ import torch.nn.functional as F
 
 from .base_network import BaseNetwork
 from configs import NetworkConfig
+from problems.vrpbtw import NODE_FEAT_DIM, VEH_FEAT_DIM, EDGE_FEAT_DIM
 
 
 # ---------------------------------------------------------------------------
-# Normalisation helper
+# Shared sub-modules
 # ---------------------------------------------------------------------------
 
 
-def _make_norm(use_instance_norm: bool, dim: int) -> nn.Module:
-    """Instance norm (paper) or LayerNorm — toggled by config."""
-    if use_instance_norm:
-        # InstanceNorm1d expects (B, C, L); we wrap it to accept (B, L, C)
-        return _InstanceNormWrapper(dim)
-    return nn.LayerNorm(dim)
+def _make_norm(use_in: bool, dim: int) -> nn.Module:
+    return _InstanceNormWrapper(dim) if use_in else nn.LayerNorm(dim)
 
 
 class _InstanceNormWrapper(nn.Module):
-    """Wraps InstanceNorm1d to operate on (B, T, D) tensors."""
-
     def __init__(self, dim: int):
         super().__init__()
         self.norm = nn.InstanceNorm1d(dim, affine=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D) → transpose → (B, D, T) → norm → (B, T, D)
         return self.norm(x.transpose(1, 2)).transpose(1, 2)
 
 
-# ---------------------------------------------------------------------------
-# Multi-head attention  (shared by both encoder stages and decoder)
-# ---------------------------------------------------------------------------
-
-
 class _MHA(nn.Module):
-    """
-    Multi-head attention.
-    query, key, value may come from different sequences (cross-attention).
-    """
+    """Multi-head attention supporting self and cross variants."""
 
     def __init__(self, D: int, H: int, dropout: float = 0.0):
         super().__init__()
         assert D % H == 0
-        self.H = H
-        self.Dh = D // H
-        self.D = D
+        self.H, self.Dh, self.D = H, D // H, D
         self.Wq = nn.Linear(D, D, bias=False)
         self.Wk = nn.Linear(D, D, bias=False)
         self.Wv = nn.Linear(D, D, bias=False)
@@ -110,39 +112,28 @@ class _MHA(nn.Module):
         mask: Optional[torch.Tensor] = None,  # (B, Tq, Tk) bool True=ignore
     ) -> torch.Tensor:
         B, Tq, _ = q.shape
-        B, Tk, _ = k.shape
+        _, Tk, _ = k.shape
         H, Dh = self.H, self.Dh
 
         def reshape(t, T):
-            return t.view(B, T, H, Dh).transpose(1, 2)  # (B, H, T, Dh)
+            return t.view(B, T, H, Dh).transpose(1, 2)
 
         Q = reshape(self.Wq(q), Tq)
         K = reshape(self.Wk(k), Tk)
         V = reshape(self.Wv(v), Tk)
-
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Dh)  # (B,H,Tq,Tk)
+        sc = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(Dh)
         if mask is not None:
-            scores = scores.masked_fill(mask.unsqueeze(1), float("-inf"))
-        attn = self.drop(torch.softmax(scores, dim=-1))
-
-        out = torch.matmul(attn, V)  # (B, H, Tq, Dh)
-        out = out.transpose(1, 2).contiguous().view(B, Tq, self.D)
+            sc = sc.masked_fill(mask.unsqueeze(1), float("-inf"))
+        at = self.drop(torch.softmax(sc, dim=-1))
+        out = torch.matmul(at, V).transpose(1, 2).contiguous().view(B, Tq, self.D)
         return self.Wo(out)
-
-
-# ---------------------------------------------------------------------------
-# Feed-forward sub-layer
-# ---------------------------------------------------------------------------
 
 
 class _FF(nn.Module):
     def __init__(self, D: int, dropout: float = 0.0):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(D, D * 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(D * 4, D),
+            nn.Linear(D, D * 4), nn.ReLU(), nn.Dropout(dropout), nn.Linear(D * 4, D)
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -150,83 +141,208 @@ class _FF(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Two-stage heterogeneous encoder block
+# Encoder block  (self-attn + heterogeneous cross-attn)
 # ---------------------------------------------------------------------------
 
 
 class _HACNEncoderBlock(nn.Module):
-    """
-    One encoder block = Stage1 (self-attn) + Stage2 (het-attn) + FF.
-
-    Following eq. 18 of Wang et al.:
-      h = IN(h + h_sa + h_het)
-      h = IN(h + FF(h))
-
-    Stage 2 uses SEPARATE weight matrices for linehaul→backhaul
-    and backhaul→linehaul attention, mirroring the paper's
-    dual-structure heterogeneous attention (Fig. 5).
-    """
-
     def __init__(self, D: int, H: int, dropout: float, use_in: bool):
         super().__init__()
-        # Stage 1: self-attention over all nodes
         self.sa = _MHA(D, H, dropout)
-
-        # Stage 2: separate weight matrices for each direction
-        self.het_l2b = _MHA(D, H, dropout)  # linehaul queries → backhaul K/V
-        self.het_b2l = _MHA(D, H, dropout)  # backhaul queries → linehaul K/V
-
+        self.het_l2b = _MHA(D, H, dropout)
+        self.het_b2l = _MHA(D, H, dropout)
         self.ff = _FF(D, dropout)
         self.norm1 = _make_norm(use_in, D)
         self.norm2 = _make_norm(use_in, D)
 
     def forward(
         self,
-        h: torch.Tensor,  # (B, N+1, D)  all nodes
-        h_l: torch.Tensor,  # (B, M,   D)  linehaul slice
-        h_b: torch.Tensor,  # (B, P,   D)  backhaul slice
-        l_idx: torch.Tensor,  # (M,)  linehaul node indices
-        b_idx: torch.Tensor,  # (P,)  backhaul node indices
+        h: torch.Tensor,  # (B, N+1, D)
+        h_l: torch.Tensor,  # (B, M,   D)
+        h_b: torch.Tensor,  # (B, P,   D)
+        l_idx: torch.Tensor,  # (M,)
+        b_idx: torch.Tensor,  # (P,)
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Stage 1
-        h_sa = self.sa(h, h, h)  # (B, N+1, D)
-
-        # Stage 2 — only update linehaul and backhaul, depot unchanged
+        h_sa = self.sa(h, h, h)
         h_het = torch.zeros_like(h)
         if h_l.shape[1] > 0 and h_b.shape[1] > 0:
-            h_l_new = self.het_l2b(h_l, h_b, h_b)  # (B, M, D)
-            h_b_new = self.het_b2l(h_b, h_l, h_l)  # (B, P, D)
-            h_het[:, l_idx] = h_l_new
-            h_het[:, b_idx] = h_b_new
-
-        # Skip + norm (eq. 18)
+            h_het[:, l_idx] = self.het_l2b(h_l, h_b, h_b)
+            h_het[:, b_idx] = self.het_b2l(h_b, h_l, h_l)
         h = self.norm1(h + h_sa + h_het)
         h = self.norm2(h + self.ff(h))
-
-        # Re-extract updated slices for next block
         h_l = h[:, l_idx] if h_l.shape[1] > 0 else h_l
         h_b = h[:, b_idx] if h_b.shape[1] > 0 else h_b
         return h, h_l, h_b
 
 
 # ---------------------------------------------------------------------------
-# Vehicle embedding MLP
+# Vehicle GNN
 # ---------------------------------------------------------------------------
 
 
-class _VehicleEmbedder(nn.Module):
-    """Projects raw vehicle features (2K, VEH_FEAT_DIM) → (2K, D)."""
+class _EdgeConvMessage(nn.Module):
+    """
+    One edge-conditioned message passing layer.
 
-    def __init__(self, veh_feat_dim: int, D: int):
+    For each edge (u→v) with edge feature e_uv:
+        m_uv = MLP([h_u ; e_uv])
+    Aggregation at v: h_v' = h_v + mean(m_uv for all u→v)
+    Followed by residual LayerNorm.
+    """
+
+    def __init__(self, D: int, edge_feat_dim: int, dropout: float = 0.0):
         super().__init__()
-        self.proj = nn.Sequential(
-            nn.Linear(veh_feat_dim, D),
+        self.msg_mlp = nn.Sequential(
+            nn.Linear(D + edge_feat_dim, D),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(D, D),
         )
+        self.norm = nn.LayerNorm(D)
 
-    def forward(self, veh: torch.Tensor) -> torch.Tensor:
-        return self.proj(veh)  # (B, 2K, D)
+    def forward(
+        self,
+        h: torch.Tensor,  # (V, D)  node embeddings
+        edge_index: torch.Tensor,  # (2, E)  long
+        edge_attr: torch.Tensor,  # (E, edge_feat_dim)
+    ) -> torch.Tensor:
+        if edge_index.shape[1] == 0:
+            return h  # empty graph: no messages
+
+        src, dst = edge_index[0], edge_index[1]
+        h_src = h[src]  # (E, D)
+        msg = self.msg_mlp(torch.cat([h_src, edge_attr], dim=-1))  # (E, D)
+
+        # mean aggregation per destination node
+        V = h.shape[0]
+        agg = torch.zeros(V, h.shape[1], device=h.device, dtype=h.dtype)
+        count = torch.zeros(V, 1, device=h.device, dtype=h.dtype)
+        agg.scatter_add_(0, dst.unsqueeze(1).expand_as(msg), msg)
+        count.scatter_add_(
+            0,
+            dst.unsqueeze(1),
+            torch.ones(dst.shape[0], 1, device=h.device, dtype=h.dtype),
+        )
+        count = count.clamp(min=1.0)
+        agg = agg / count
+
+        return self.norm(h + agg)
+
+
+class _VehicleGNN(nn.Module):
+    """
+    GNN over the partial-solution fleet graph.
+
+    Input per visited node v:
+        Z_node[v]          (D,)   cached encoder embedding
+        visit_time[v]      (1,)   normalised
+        visiting_fleet[v]  (K,)   one-hot fleet id
+        visiting_vehicle[v](1,)   0=truck 1=drone
+    Total node input dim: D + 1 + K + 1
+
+    After L' layers of edge-conditioned message passing → Z_graph (V_t, D).
+
+    Vehicle readout:
+        base   = Z_graph[current_node]  (or zero_vec if no visited nodes yet)
+        props  = MLP(vehicle_feature_row)
+        Z_veh  = LayerNorm(base + props)
+    """
+
+    def __init__(
+        self,
+        D: int,
+        K: int,
+        edge_feat_dim: int,
+        n_layers: int = 2,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.D = D
+        self.K = K
+        node_in_dim = D + 1 + K + 1  # Z_node + visit_time + fleet_onehot + vtype
+
+        self.node_proj = nn.Linear(node_in_dim, D)
+        self.layers = nn.ModuleList(
+            [_EdgeConvMessage(D, edge_feat_dim, dropout) for _ in range(n_layers)]
+        )
+        self.props_mlp = nn.Sequential(
+            nn.Linear(VEH_FEAT_DIM, D), nn.ReLU(), nn.Linear(D, D)
+        )
+        self.readout_norm = nn.LayerNorm(D)
+
+    def forward(
+        self,
+        Z_node_full: torch.Tensor,  # (N+1, D)   full encoder output
+        veh_feat: torch.Tensor,  # (2K, VEH_FEAT_DIM)
+        edge_index: torch.Tensor,  # (2, E)  long  or (2,0)
+        edge_attr: torch.Tensor,  # (E, EDGE_FEAT_DIM)
+        visited_nodes: List[int],  # sorted list of visited node indices
+        visit_meta: torch.Tensor,  # (|V_t|, 1+K+1)  [time, fleet_oh, vtype]
+        current_nodes: List[int],  # (2K,)  current node per vehicle
+    ) -> torch.Tensor:  # (2K, D)
+        D = self.D
+        device = Z_node_full.device
+
+        # ── Build per-visited-node features ──────────────────────────
+        if len(visited_nodes) == 0:
+            # empty graph: vehicle embeddings come from properties only
+            props = self.props_mlp(veh_feat)  # (2K, D)
+            zero_base = torch.zeros(len(current_nodes), D, device=device)
+            return self.readout_norm(zero_base + props)
+
+        v_idx = torch.tensor(visited_nodes, dtype=torch.long, device=device)
+        Z_vis = Z_node_full[v_idx]  # (|V_t|, D)
+        h_in = torch.cat([Z_vis, visit_meta], dim=-1)  # (|V_t|, D+1+K+1)
+        h = self.node_proj(h_in)  # (|V_t|, D)
+
+        # remap global node indices to local indices for message passing
+        local_map = {g: l for l, g in enumerate(visited_nodes)}
+
+        if edge_index.shape[1] > 0:
+            src_g, dst_g = edge_index[0].tolist(), edge_index[1].tolist()
+            # keep only edges where both endpoints are in visited_nodes
+            valid = [
+                (s, d)
+                for s, d in zip(src_g, dst_g)
+                if s in local_map and d in local_map
+            ]
+            if valid:
+                src_l = torch.tensor(
+                    [local_map[s] for s, _ in valid], dtype=torch.long, device=device
+                )
+                dst_l = torch.tensor(
+                    [local_map[d] for _, d in valid], dtype=torch.long, device=device
+                )
+                e_idx_local = torch.stack([src_l, dst_l], dim=0)
+                # reindex edge_attr to match valid edges
+                valid_mask = torch.tensor(
+                    [
+                        i
+                        for i, (s, d) in enumerate(zip(src_g, dst_g))
+                        if s in local_map and d in local_map
+                    ],
+                    dtype=torch.long,
+                    device=device,
+                )
+                e_attr_local = edge_attr[valid_mask]
+            else:
+                e_idx_local = torch.zeros(2, 0, dtype=torch.long, device=device)
+                e_attr_local = torch.zeros(0, edge_attr.shape[-1], device=device)
+        else:
+            e_idx_local = torch.zeros(2, 0, dtype=torch.long, device=device)
+            e_attr_local = torch.zeros(0, edge_attr.shape[-1], device=device)
+
+        # ── Message passing ──────────────────────────────────────────
+        for layer in self.layers:
+            h = layer(h, e_idx_local, e_attr_local)  # (|V_t|, D)
+
+        # ── Vehicle readout ──────────────────────────────────────────
+        props = self.props_mlp(veh_feat)  # (2K, D)
+        Z_veh = torch.zeros(len(current_nodes), D, device=device)
+        for vi, cn in enumerate(current_nodes):
+            if cn in local_map:
+                Z_veh[vi] = h[local_map[cn]]
+        return self.readout_norm(Z_veh + props)  # (2K, D)
 
 
 # ---------------------------------------------------------------------------
@@ -236,286 +352,387 @@ class _VehicleEmbedder(nn.Module):
 
 class HACNNetwork(BaseNetwork):
     """
-    Heterogeneous Attention Construction Network.
+    Heterogeneous Attention Construction Network for VRPBTW.
 
     Parameters
     ----------
-    obs_shape : (N+1, NODE_FEAT_DIM) from problem.observation_shape.
-                The network infers all other sizes (N+1, 2K, feat_dim)
-                from input tensors at forward time — no problem-size
-                constants are stored on the network.
+    obs_shape : (N+1, NODE_FEAT_DIM) from problem.observation_shape
     cfg       : NetworkConfig
+    n_fleets  : K (number of fleets, i.e. truck-drone pairs)
     """
 
     def __init__(
         self,
         obs_shape: Tuple[int, ...],
         cfg: NetworkConfig,
+        n_fleets: int = 2,
     ):
         super().__init__()
         self.cfg = cfg
         self.obs_shape = obs_shape
-        # n_vehicles (2K) is inferred from vehicle_features.shape[1] at forward time
+        self.K = n_fleets
 
-        N1 = obs_shape[0]  # N+1 nodes
-        feat_dim = obs_shape[1]  # NODE_FEAT_DIM = 9
         D = cfg.embed_dim
         H = cfg.n_heads
         L = cfg.n_encoder_layers
         drop = cfg.dropout
-        use_in = cfg.use_instance_norm
+        use_in = getattr(cfg, "use_instance_norm", True)
 
-        # ── Encoder ────────────────────────────────────────────────────
-        self.node_embed = nn.Linear(feat_dim, D)
+        # ── Encoder ─────────────────────────────────────────────────
+        self.node_embed = nn.Linear(NODE_FEAT_DIM, D)
         self.enc_blocks = nn.ModuleList(
             [_HACNEncoderBlock(D, H, drop, use_in) for _ in range(L)]
         )
 
-        # ── Vehicle embedder ───────────────────────────────────────────
-        from problems.vrpbtw import VEH_FEAT_DIM
-
-        self.veh_embedder = _VehicleEmbedder(VEH_FEAT_DIM, D)
-
-        # ── Decoder Level 1 (node selector) ───────────────────────────
-        # Fleet context: graph_mean attends over vehicle embeddings
-        self.fleet_attn = _MHA(D, H, drop)
-        self.ctx_proj_L1 = nn.Linear(D * 2, D)  # [graph_mean ; fleet_ctx] → D
-
-        # Pointer attention weights
-        self.Wq_L1 = nn.Linear(D, D, bias=False)
-        self.Wk_L1 = nn.Linear(D, D, bias=False)
-
-        # ── Decoder Level 2 (vehicle selector) ────────────────────────
-        # Per-vehicle context: [veh_emb ; target_node_emb ; dist ; arrival ; tardiness]
-        # 2D + 3 scalars; we project scalars separately then add
-        self.ctx_proj_L2 = nn.Linear(D * 2 + 3, D)
-        self.score_L2 = nn.Linear(D, 1)
-
-        # ── Value head (stop-gradient, for PPO critic) ─────────────────
-        self.value_head = nn.Sequential(
-            nn.Linear(D, D // 2),
-            nn.Tanh(),
-            nn.Linear(D // 2, 1),
+        # ── Vehicle GNN ──────────────────────────────────────────────
+        self.vehicle_gnn = _VehicleGNN(
+            D=D,
+            K=n_fleets,
+            edge_feat_dim=EDGE_FEAT_DIM,
+            n_layers=2,
+            dropout=drop,
         )
+
+        # ── Decoder: Upper policy (node selection) ───────────────────
+        # context = MLP([graph_node ; graph_veh])
+        self.ctx_upper = nn.Sequential(nn.Linear(D * 2, D), nn.ReLU())
+        self.Wq_upper = nn.Linear(D, D, bias=False)
+        self.Wk_upper = nn.Linear(D, D, bias=False)
+
+        # ── Decoder: Lower policy (vehicle selection) ────────────────
+        # context = MLP([graph_veh ; Z_node[n*]])
+        self.ctx_lower = nn.Sequential(nn.Linear(D * 2, D), nn.ReLU())
+        self.score_lower = nn.Sequential(
+            nn.Linear(D * 2, D), nn.ReLU(), nn.Linear(D, 1)
+        )
+
+        # ── Value head ───────────────────────────────────────────────
+        self.value_head = nn.Sequential(nn.Linear(D * 2, D), nn.Tanh(), nn.Linear(D, 1))
 
         if cfg.ortho_init:
             self._ortho_init(self)
 
     # ------------------------------------------------------------------
-    # Encode  (called once per instance in practice)
+    # Encode  (called once per instance; output cached by caller)
     # ------------------------------------------------------------------
 
     def encode(
         self,
-        node_feat: torch.Tensor,  # (B, N+1, feat_dim)
-        l_idx: torch.Tensor,  # (M,)  linehaul indices on device
-        b_idx: torch.Tensor,  # (P,)  backhaul indices on device
+        node_feat: torch.Tensor,  # (B, N+1, NODE_FEAT_DIM)
+        l_idx: torch.Tensor,  # (M,)  linehaul indices
+        b_idx: torch.Tensor,  # (P,)  backhaul indices
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        static_emb : (B, N+1, D)  node embeddings
-        graph_emb  : (B, D)       mean pooling
-        """
-        h = self.node_embed(node_feat)  # (B, N+1, D)
+        """Returns Z_node (B, N+1, D) and graph_node (B, D)."""
+        h = self.node_embed(node_feat)
         h_l = h[:, l_idx] if l_idx.numel() > 0 else h[:, :0]
         h_b = h[:, b_idx] if b_idx.numel() > 0 else h[:, :0]
-
-        for block in self.enc_blocks:
-            h, h_l, h_b = block(h, h_l, h_b, l_idx, b_idx)
-
+        for blk in self.enc_blocks:
+            h, h_l, h_b = blk(h, h_l, h_b, l_idx, b_idx)
         return h, h.mean(dim=1)
 
     # ------------------------------------------------------------------
-    # Decode Level 1 — node selector
+    # GNN vehicle embeddings  (called every step)
     # ------------------------------------------------------------------
 
-    def _decode_L1(
+    def embed_vehicles(
         self,
-        graph_emb: torch.Tensor,  # (B, D)
-        static_emb: torch.Tensor,  # (B, N+1, D)
-        veh_emb: torch.Tensor,  # (B, 2K, D)
-        node_mask: Optional[
-            torch.Tensor
-        ],  # (B, N+1) bool True=feasible; None=all feasible
+        Z_node: torch.Tensor,  # (N+1, D)   single-instance encoder output
+        veh_feat: torch.Tensor,  # (2K, VEH_FEAT_DIM)
+        edge_index: torch.Tensor,  # (2, E)
+        edge_attr: torch.Tensor,  # (E, EDGE_FEAT_DIM)
+        visited_nodes: List[int],  # sorted list of visited global indices
+        visit_meta: torch.Tensor,  # (|V_t|, 1+K+1)
+        current_nodes: List[int],  # (2K,) current node per vehicle
+    ) -> torch.Tensor:  # (2K, D)
+        return self.vehicle_gnn(
+            Z_node,
+            veh_feat,
+            edge_index,
+            edge_attr,
+            visited_nodes,
+            visit_meta,
+            current_nodes,
+        )
+
+    # ------------------------------------------------------------------
+    # Decode Upper (node selection)
+    # ------------------------------------------------------------------
+
+    def _decode_upper(
+        self,
+        graph_node: torch.Tensor,  # (B, D)
+        graph_veh: torch.Tensor,  # (B, D)
+        Z_node: torch.Tensor,  # (B, N+1, D)
+        node_mask: Optional[torch.Tensor],  # (B, N+1) True=feasible
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        logits_L1   : (B, N+1) — masked node scores
-        context_L1  : (B, D)   — context vector for value head
-        """
-        B = graph_emb.shape[0]
-
-        # Fleet context: graph_mean queries all vehicle embeddings
-        g = graph_emb.unsqueeze(1)  # (B, 1, D)
-        fleet_ctx = self.fleet_attn(g, veh_emb, veh_emb)  # (B, 1, D)
-        fleet_ctx = fleet_ctx.squeeze(1)  # (B, D)
-
-        context_L1 = self.ctx_proj_L1(
-            torch.cat([graph_emb, fleet_ctx], dim=-1)
-        )  # (B, D)
-
-        # Pointer attention
-        query = self.Wq_L1(context_L1).unsqueeze(1)  # (B, 1, D)
-        keys = self.Wk_L1(static_emb)  # (B, N+1, D)
+        """Returns logits_upper (B, N+1) and context_upper (B, D)."""
+        ctx = self.ctx_upper(torch.cat([graph_node, graph_veh], dim=-1))  # (B, D)
+        query = self.Wq_upper(ctx).unsqueeze(1)  # (B, 1, D)
+        keys = self.Wk_upper(Z_node)  # (B, N+1, D)
         logits = torch.bmm(query, keys.transpose(1, 2)).squeeze(1) / math.sqrt(
             self.cfg.embed_dim
-        )
-        logits = self.cfg.clip_logits * torch.tanh(logits)  # (B, N+1)
+        )  # (B, N+1)
+        logits = self.cfg.clip_logits * torch.tanh(logits)
         logits = self._apply_mask(logits, node_mask)
-
-        return logits, context_L1
+        return logits, ctx
 
     # ------------------------------------------------------------------
-    # Decode Level 2 — vehicle selector
+    # Decode Lower (vehicle selection)
     # ------------------------------------------------------------------
 
-    def _decode_L2(
+    def _decode_lower(
         self,
-        veh_emb: torch.Tensor,  # (B, 2K, D)
-        target_emb: torch.Tensor,  # (B, D)   selected node embedding
-        dist_to_node: torch.Tensor,  # (B, 2K)  travel distance
-        arrival_time: torch.Tensor,  # (B, 2K)  estimated arrival
-        tardiness: torch.Tensor,  # (B, 2K)  tardiness if assigned
-        veh_mask: Optional[
-            torch.Tensor
-        ],  # (B, 2K)  bool True=feasible; None=all feasible
+        graph_veh: torch.Tensor,  # (B, D)
+        Z_node_sel: torch.Tensor,  # (B, D)  Z_node[n*]
+        Z_veh: torch.Tensor,  # (B, 2K, D)
+        veh_mask: Optional[torch.Tensor],  # (B, 2K) True=feasible
     ) -> torch.Tensor:
-        """
-        Returns
-        -------
-        logits_L2 : (B, 2K) — masked vehicle scores
-        """
-        B, V, D = veh_emb.shape
-        target = target_emb.unsqueeze(1).expand(B, V, D)  # (B, 2K, D)
-
-        scalars = torch.stack(
-            [dist_to_node, arrival_time, tardiness], dim=-1
-        )  # (B, 2K, 3)
-
-        ctx = torch.cat([veh_emb, target, scalars], dim=-1)  # (B, 2K, 2D+3)
-        ctx = F.relu(self.ctx_proj_L2(ctx))  # (B, 2K, D)
-
-        logits = self.score_L2(ctx).squeeze(-1)  # (B, 2K)
+        """Returns logits_lower (B, 2K)."""
+        ctx = self.ctx_lower(torch.cat([graph_veh, Z_node_sel], dim=-1))  # (B, D)
+        ctx_e = ctx.unsqueeze(1).expand_as(Z_veh)  # (B, 2K, D)
+        logits = self.score_lower(torch.cat([Z_veh, ctx_e], dim=-1)).squeeze(
+            -1
+        )  # (B, 2K)
         logits = self._apply_mask(logits, veh_mask)
         return logits
 
     # ------------------------------------------------------------------
-    # Forward  (full hierarchical decode)
+    # Helpers: obs → tensors
+    # ------------------------------------------------------------------
+
+    def _prep_batch(
+        self, obs: Dict, device: str
+    ) -> Tuple[torch.Tensor, torch.Tensor, List, List, List]:
+        """
+        Returns:
+            node_feat  (B, N+1, NODE_FEAT_DIM)
+            veh_feat   (B, 2K,  VEH_FEAT_DIM)
+            edge_index list[B]  each (2, E_b)  LongTensor
+            edge_attr  list[B]  each (E_b, EDGE_FEAT_DIM) FloatTensor
+            edge_fleet list[B]  each (E_b,)  LongTensor
+        """
+        nf = torch.FloatTensor(obs["node_features"]).to(device)
+        vf = torch.FloatTensor(obs["vehicle_features"]).to(device)
+        ei = obs["edge_index"]
+        ea = obs["edge_attr"]
+        ef = obs["edge_fleet"]
+        # handle single-instance (non-batched) dicts
+        if nf.dim() == 2:
+            nf = nf.unsqueeze(0)
+            vf = vf.unsqueeze(0)
+            ei = [ei]
+            ea = [ea]
+            ef = [ef]
+        ei_t = [torch.LongTensor(np.array(e, dtype=np.int64)).to(device) for e in ei]
+        ea_t = [torch.FloatTensor(np.array(a, dtype=np.float32)).to(device) for a in ea]
+        ef_t = [torch.LongTensor(np.array(f, dtype=np.int64)).to(device) for f in ef]
+        return nf, vf, ei_t, ea_t, ef_t
+
+    def _node_indices(self, node_feat: torch.Tensor):
+        """Derive linehaul / backhaul indices from demand column (col 2)."""
+        demand = node_feat[0, :, 2]
+        l_idx = torch.where(demand > 0)[0]
+        b_idx = torch.where(demand < 0)[0]
+        return l_idx, b_idx
+
+    @staticmethod
+    def _visited_and_meta(
+        edge_index: torch.Tensor,  # (2, E)
+        edge_attr: torch.Tensor,  # (E, EDGE_FEAT_DIM) col0=vtype col4=arrive_time
+        edge_fleet: torch.Tensor,  # (E,)  fleet id per edge
+        K: int,
+        device: str,
+    ) -> Tuple[List[int], torch.Tensor]:
+        """
+        Derive visited node list and visit_meta tensor from edge data.
+
+        visit_meta[i] shape: (1 + K + 1,)
+            [0]      : latest arrive_time at node i  (edge_attr col 4)
+            [1..K]   : one-hot fleet id of last edge arriving at i
+            [K+1]    : vehicle type of that edge  (0=truck 1=drone, edge_attr col 0)
+        """
+        if edge_index.shape[1] == 0:
+            return [], torch.zeros(0, 1 + K + 1, device=device)
+
+        all_nodes_t = torch.cat([edge_index[0], edge_index[1]]).unique()
+        all_nodes = sorted(all_nodes_t.tolist())
+        V = len(all_nodes)
+        meta = torch.zeros(V, 1 + K + 1, device=device)
+        local_map = {int(g): l for l, g in enumerate(all_nodes)}
+
+        # for each edge, update destination node meta (last edge wins)
+        dst_list = edge_index[1].tolist()
+        for ei_idx, dst_g in enumerate(dst_list):
+            dst_g = int(dst_g)
+            if dst_g not in local_map:
+                continue
+            li = local_map[dst_g]
+            arr_t = float(edge_attr[ei_idx, 4].item())
+            fleet_id = int(edge_fleet[ei_idx].item())
+            vtype = float(edge_attr[ei_idx, 0].item())
+            meta[li, 0] = arr_t
+            meta[li, 1 : 1 + K] = 0.0
+            if 0 <= fleet_id < K:
+                meta[li, 1 + fleet_id] = 1.0
+            meta[li, 1 + K] = vtype
+
+        return all_nodes, meta
+
+    @staticmethod
+    def _upper_mask(action_mask: torch.Tensor, N1: int, V2K: int) -> torch.Tensor:
+        """
+        Node-level mask: node j is feasible if ANY vehicle can act on it.
+        action_mask: (B, N1 * 2K)  flat = node * 2K + v_idx
+        """
+        B = action_mask.shape[0]
+        m = action_mask.view(B, N1, V2K)
+        return m.any(dim=-1)  # (B, N1)
+
+    @staticmethod
+    def _lower_mask(
+        action_mask: torch.Tensor, node_id: torch.Tensor, N1: int, V2K: int
+    ) -> torch.Tensor:
+        """
+        Vehicle-level mask for selected node n*.
+        action_mask: (B, N1 * 2K)
+        node_id:     (B,)
+        Returns: (B, 2K)
+        """
+        B = action_mask.shape[0]
+        m = action_mask.view(B, N1, V2K)
+        idx = node_id.view(B, 1, 1).expand(B, 1, V2K)
+        return m.gather(1, idx).squeeze(1)  # (B, 2K)
+
+    # ------------------------------------------------------------------
+    # forward  (for evaluate_actions in PPO update)
     # ------------------------------------------------------------------
 
     def forward(
         self,
-        obs: dict,
-        action_mask: Optional[torch.Tensor] = None,  # (B, K*2*(N+1)) flat
-        context: Optional[dict] = None,  # extra tensors from env
+        obs: Dict,
+        action_mask: Optional[torch.Tensor] = None,  # (B, N1*2K)
+        context: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Returns
-        -------
-        flat_logits : (B, K*2*(N+1))  joint logits over all (vehicle,node) pairs
-        value       : (B,)
+        device = next(self.parameters()).device.type
+        nf, vf, ei_t, ea_t, ef_t = self._prep_batch(obs, device)
+        B, N1, _ = nf.shape
+        V2K = vf.shape[1]
+        l_idx, b_idx = self._node_indices(nf)
 
-        This is the standard BaseNetwork forward() contract — used during
-        PPO's evaluate_actions().  For action selection, use
-        get_action_and_log_prob() which properly runs the two-level decode.
-        """
-        node_feat = obs["node_features"]  # (B, N+1, feat_dim)
-        veh_feat = obs["vehicle_features"]  # (B, 2K, veh_feat_dim)
+        # encoder (batch)
+        Z_node, graph_node = self.encode(nf, l_idx, b_idx)  # (B, N+1, D), (B, D)
 
-        l_idx, b_idx = self._node_indices(node_feat)
-        static_emb, graph_emb = self.encode(node_feat, l_idx, b_idx)
-        veh_emb = self.veh_embedder(veh_feat)  # (B, 2K, D)
+        # vehicle GNN — run per sample (variable graph size)
+        Z_veh_list = []
+        for b in range(B):
+            visited, v_meta = self._visited_and_meta(
+                ei_t[b], ea_t[b], ef_t[b], self.K, device
+            )
+            # current_node per vehicle: recover from veh_feat col 0 (node/N)
+            # multiply back and round to nearest int
+            cur_nodes = [
+                int(round(float(vf[b, vi, 0].item()) * (N1 - 1))) for vi in range(V2K)
+            ]
+            z_v = self.vehicle_gnn(
+                Z_node[b],
+                vf[b],
+                ei_t[b],
+                ea_t[b],
+                visited,
+                v_meta,
+                cur_nodes,
+            )  # (2K, D)
+            Z_veh_list.append(z_v)
+        Z_veh = torch.stack(Z_veh_list, dim=0)  # (B, 2K, D)
+        graph_veh = Z_veh.mean(dim=1)  # (B, D)
 
-        B, N1, D = static_emb.shape
-        V = veh_emb.shape[1]
-        K = V // 2
-
-        # Build node-level mask: node i is feasible if ANY vehicle can serve it
-        if action_mask is not None:
-            node_mask = self._node_level_mask(action_mask, N1, V)
-        else:
-            node_mask = None
-
-        logits_L1, ctx_L1 = self._decode_L1(graph_emb, static_emb, veh_emb, node_mask)
-
-        # For flat logits (needed by evaluate_actions), we compute vehicle
-        # scores for every node simultaneously
-        flat_logits = self._build_flat_logits(
-            logits_L1, static_emb, veh_emb, veh_feat, action_mask, N1, V
+        # upper mask
+        node_mask = (
+            self._upper_mask(action_mask, N1, V2K) if action_mask is not None else None
         )
 
-        value = self.value_head(ctx_L1.detach()).squeeze(-1)
+        logits_U, ctx_U = self._decode_upper(graph_node, graph_veh, Z_node, node_mask)
+
+        # build flat logits by scoring all (node, vehicle) pairs
+        flat_logits = self._build_flat_logits(
+            logits_U, Z_node, graph_veh, Z_veh, action_mask, N1, V2K, device
+        )
+
+        value = self.value_head(
+            torch.cat([ctx_U.detach(), graph_veh.detach()], dim=-1)
+        ).squeeze(-1)
+
         return flat_logits, value
 
     # ------------------------------------------------------------------
-    # get_action_and_log_prob  — proper two-level sampling
+    # get_action_and_log_prob  (two-level sampling)
     # ------------------------------------------------------------------
 
     def get_action_and_log_prob(
         self,
-        obs: dict,
+        obs: Dict,
         action_mask: Optional[torch.Tensor] = None,
-        context: Optional[dict] = None,
+        context: Optional[Dict] = None,
         deterministic: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Two-level hierarchical action selection.
+        device = next(self.parameters()).device.type
+        nf, vf, ei_t, ea_t, ef_t = self._prep_batch(obs, device)
+        B, N1, _ = nf.shape
+        V2K = vf.shape[1]
+        l_idx, b_idx = self._node_indices(nf)
 
-        Returns
-        -------
-        action   : (B,)  flat integer action
-        log_prob : (B,)  log p(node) + log p(vehicle|node)
-        value    : (B,)
-        """
-        node_feat = obs["node_features"]
-        veh_feat = obs["vehicle_features"]
+        Z_node, graph_node = self.encode(nf, l_idx, b_idx)
 
-        l_idx, b_idx = self._node_indices(node_feat)
-        static_emb, graph_emb = self.encode(node_feat, l_idx, b_idx)
-        veh_emb = self.veh_embedder(veh_feat)
+        Z_veh_list = []
+        for b in range(B):
+            visited, v_meta = self._visited_and_meta(
+                ei_t[b], ea_t[b], ef_t[b], self.K, device
+            )
+            cur_nodes = [
+                int(round(float(vf[b, vi, 0].item()) * (N1 - 1))) for vi in range(V2K)
+            ]
+            Z_veh_list.append(
+                self.vehicle_gnn(
+                    Z_node[b],
+                    vf[b],
+                    ei_t[b],
+                    ea_t[b],
+                    visited,
+                    v_meta,
+                    cur_nodes,
+                )
+            )
+        Z_veh = torch.stack(Z_veh_list, dim=0)  # (B, 2K, D)
+        graph_veh = Z_veh.mean(dim=1)  # (B, D)
 
-        B, N1, D = static_emb.shape
-        V = veh_emb.shape[1]
-
-        # ── Level 1: select node ──────────────────────────────────────
-        if action_mask is not None:
-            node_mask = self._node_level_mask(action_mask, N1, V)
-        else:
-            node_mask = torch.ones(B, N1, dtype=torch.bool, device=node_feat.device)
-
-        logits_L1, ctx_L1 = self._decode_L1(graph_emb, static_emb, veh_emb, node_mask)
-
-        dist_L1 = torch.distributions.Categorical(logits=logits_L1)
-        node_id = logits_L1.argmax(dim=-1) if deterministic else dist_L1.sample()
-        lp_node = dist_L1.log_prob(node_id)
-
-        # ── Level 2: select vehicle for chosen node ────────────────────
-        target_emb = static_emb[torch.arange(B), node_id]  # (B, D)
-        dist_t, arr_t, tard_t = self._vehicle_scalars(veh_feat, node_feat, node_id)
-
-        if action_mask is not None:
-            veh_mask = self._vehicle_level_mask(action_mask, node_id, N1, V)
-        else:
-            veh_mask = torch.ones(B, V, dtype=torch.bool, device=node_feat.device)
-
-        logits_L2 = self._decode_L2(
-            veh_emb, target_emb, dist_t, arr_t, tard_t, veh_mask
+        node_mask = (
+            self._upper_mask(action_mask, N1, V2K) if action_mask is not None else None
         )
 
-        dist_L2 = torch.distributions.Categorical(logits=logits_L2)
-        vehicle_id = logits_L2.argmax(dim=-1) if deterministic else dist_L2.sample()
-        lp_vehicle = dist_L2.log_prob(vehicle_id)
+        logits_U, ctx_U = self._decode_upper(graph_node, graph_veh, Z_node, node_mask)
 
-        # ── Encode back to flat action ─────────────────────────────────
-        # vehicle_id = fleet*2 + vehicle_type
-        fleet = vehicle_id // 2
-        vehicle_type = vehicle_id % 2
-        flat_action = fleet * (2 * N1) + vehicle_type * N1 + node_id
+        dist_U = torch.distributions.Categorical(logits=logits_U)
+        node_id = logits_U.argmax(dim=-1) if deterministic else dist_U.sample()
+        lp_node = dist_U.log_prob(node_id)
 
-        log_prob = lp_node + lp_vehicle
-        value = self.value_head(ctx_L1.detach()).squeeze(-1)
+        # lower policy
+        Z_node_sel = Z_node[torch.arange(B, device=device), node_id]  # (B, D)
+        veh_mask = (
+            self._lower_mask(action_mask, node_id, N1, V2K)
+            if action_mask is not None
+            else None
+        )
+        logits_L = self._decode_lower(graph_veh, Z_node_sel, Z_veh, veh_mask)
+
+        dist_L = torch.distributions.Categorical(logits=logits_L)
+        veh_id = logits_L.argmax(dim=-1) if deterministic else dist_L.sample()
+        lp_veh = dist_L.log_prob(veh_id)
+
+        flat_action = node_id * V2K + veh_id
+        log_prob = lp_node + lp_veh
+        value = self.value_head(
+            torch.cat([ctx_U.detach(), graph_veh.detach()], dim=-1)
+        ).squeeze(-1)
 
         return flat_action, log_prob, value
 
@@ -525,198 +742,99 @@ class HACNNetwork(BaseNetwork):
 
     def evaluate_actions(
         self,
-        obs: dict,
-        actions: torch.Tensor,  # (B,) flat actions
+        obs: Dict,
+        actions: torch.Tensor,  # (B,) flat
         action_mask: Optional[torch.Tensor] = None,
-        context: Optional[dict] = None,
+        context: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        node_feat = obs["node_features"]
-        veh_feat = obs["vehicle_features"]
+        device = next(self.parameters()).device.type
+        nf, vf, ei_t, ea_t, ef_t = self._prep_batch(obs, device)
+        B, N1, _ = nf.shape
+        V2K = vf.shape[1]
+        l_idx, b_idx = self._node_indices(nf)
 
-        l_idx, b_idx = self._node_indices(node_feat)
-        static_emb, graph_emb = self.encode(node_feat, l_idx, b_idx)
-        veh_emb = self.veh_embedder(veh_feat)
+        Z_node, graph_node = self.encode(nf, l_idx, b_idx)
 
-        B, N1, D = static_emb.shape
-        V = veh_emb.shape[1]
+        Z_veh_list = []
+        for b in range(B):
+            visited, v_meta = self._visited_and_meta(
+                ei_t[b], ea_t[b], ef_t[b], self.K, device
+            )
+            cur_nodes = [
+                int(round(float(vf[b, vi, 0].item()) * (N1 - 1))) for vi in range(V2K)
+            ]
+            Z_veh_list.append(
+                self.vehicle_gnn(
+                    Z_node[b],
+                    vf[b],
+                    ei_t[b],
+                    ea_t[b],
+                    visited,
+                    v_meta,
+                    cur_nodes,
+                )
+            )
+        Z_veh = torch.stack(Z_veh_list, dim=0)
+        graph_veh = Z_veh.mean(dim=1)
 
-        # Decode node_id and vehicle_id from flat actions
-        fleet = actions // (2 * N1)
-        vehicle_type = (actions // N1) % 2
-        node_id = actions % N1
-        vehicle_id = fleet * 2 + vehicle_type
+        node_id = actions // V2K
+        veh_id = actions % V2K
 
-        # Level 1 log-prob
-        if action_mask is not None:
-            node_mask = self._node_level_mask(action_mask, N1, V)
-        else:
-            node_mask = None
-
-        logits_L1, ctx_L1 = self._decode_L1(graph_emb, static_emb, veh_emb, node_mask)
-        dist_L1 = torch.distributions.Categorical(logits=logits_L1)
-        lp_node = dist_L1.log_prob(node_id)
-        ent_node = dist_L1.entropy()
-
-        # Level 2 log-prob
-        target_emb = static_emb[torch.arange(B), node_id]
-        dist_t, arr_t, tard_t = self._vehicle_scalars(veh_feat, node_feat, node_id)
-
-        if action_mask is not None:
-            veh_mask = self._vehicle_level_mask(action_mask, node_id, N1, V)
-        else:
-            veh_mask = None
-
-        logits_L2 = self._decode_L2(
-            veh_emb, target_emb, dist_t, arr_t, tard_t, veh_mask
+        node_mask = (
+            self._upper_mask(action_mask, N1, V2K) if action_mask is not None else None
         )
-        dist_L2 = torch.distributions.Categorical(logits=logits_L2)
-        lp_vehicle = dist_L2.log_prob(vehicle_id)
-        ent_vehicle = dist_L2.entropy()
+        logits_U, ctx_U = self._decode_upper(graph_node, graph_veh, Z_node, node_mask)
+        dist_U = torch.distributions.Categorical(logits=logits_U)
+        lp_node = dist_U.log_prob(node_id)
+        ent_U = dist_U.entropy()
 
-        log_probs = lp_node + lp_vehicle
-        entropy = ent_node + ent_vehicle
-        value = self.value_head(ctx_L1.detach()).squeeze(-1)
+        Z_node_sel = Z_node[torch.arange(B, device=device), node_id]
+        veh_mask = (
+            self._lower_mask(action_mask, node_id, N1, V2K)
+            if action_mask is not None
+            else None
+        )
+        logits_L = self._decode_lower(graph_veh, Z_node_sel, Z_veh, veh_mask)
+        dist_L = torch.distributions.Categorical(logits=logits_L)
+        lp_veh = dist_L.log_prob(veh_id)
+        ent_L = dist_L.entropy()
+
+        log_probs = lp_node + lp_veh
+        entropy = ent_U + ent_L
+        value = self.value_head(
+            torch.cat([ctx_U.detach(), graph_veh.detach()], dim=-1)
+        ).squeeze(-1)
 
         return log_probs, value, entropy
 
     # ------------------------------------------------------------------
-    # Helpers
+    # Flat logits builder (used by forward / beam search)
     # ------------------------------------------------------------------
-
-    def _node_indices(
-        self,
-        node_feat: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Derive linehaul / backhaul node indices from demand column (col 2).
-        Depot (index 0) is excluded from both sets.
-        """
-        demand = node_feat[0, :, 2]  # (N+1,)  use first batch item
-        l_idx = torch.where(demand > 0)[0]
-        b_idx = torch.where(demand < 0)[0]
-        return l_idx, b_idx
-
-    @staticmethod
-    def _node_level_mask(
-        flat_mask: torch.Tensor,  # (B, K*2*(N+1))
-        N1: int,
-        V: int,  # 2K
-    ) -> torch.Tensor:
-        """
-        Node-level mask: node i is feasible if ANY vehicle can serve it.
-        flat_mask is reshaped to (B, K, 2, N1) then collapsed over vehicle dims.
-        """
-        B = flat_mask.shape[0]
-        K = V // 2
-        m = flat_mask.view(B, K, 2, N1)  # (B, K, 2, N+1)
-        return m.any(dim=1).any(dim=1)  # (B, N+1)
-
-    @staticmethod
-    def _vehicle_level_mask(
-        flat_mask: torch.Tensor,  # (B, K*2*(N+1))
-        node_id: torch.Tensor,  # (B,)
-        N1: int,
-        V: int,
-    ) -> torch.Tensor:
-        """
-        Vehicle-level mask for selected node: (B, 2K).
-        For vehicle v, check if flat_mask at (fleet=v//2, vehicle_type=v%2, node=node_id).
-        """
-        B = flat_mask.shape[0]
-        K = V // 2
-        m = flat_mask.view(B, K, 2, N1)  # (B, K, 2, N+1)
-        # gather over node dimension
-        nid = node_id.view(B, 1, 1, 1).expand(B, K, 2, 1)
-        per_vehicle = m.gather(3, nid).squeeze(-1)  # (B, K, 2)
-        return per_vehicle.view(B, V)  # (B, 2K)
-
-    def _vehicle_scalars(
-        self,
-        veh_feat: torch.Tensor,  # (B, 2K, VEH_FEAT_DIM)
-        node_feat: torch.Tensor,  # (B, N+1, NODE_FEAT_DIM)
-        node_id: torch.Tensor,  # (B,)
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Compute per-vehicle scalars for Level 2 context:
-          dist_to_node, arrival_time, tardiness_if_assigned
-        All normalised to [0, 1].
-        These are approximations derived from normalised features.
-        """
-        B, V, _ = veh_feat.shape
-
-        # Vehicle current position encoded as node index (col 0) — proxy for distance
-        veh_node_frac = veh_feat[:, :, 0]  # (B, 2K)  node/N
-        veh_time_frac = veh_feat[:, :, 2]  # (B, 2K)  time/T
-
-        # Target node time window (cols 3, 4 of node_feat)
-        tw_open = node_feat[torch.arange(B), node_id, 3]  # (B,)
-        tw_close = node_feat[torch.arange(B), node_id, 4]  # (B,)
-
-        # Approximate distance as abs difference of normalised node positions
-        # (coarse but gradient-friendly; actual dist matrix is in the env)
-        dist_approx = (
-            veh_node_frac
-            - node_id.float().unsqueeze(1) / max(node_feat.shape[1] - 1, 1)
-        ).abs()  # (B, 2K)
-
-        # Approximate arrival: current time + distance (speed=1 for trucks, 2 for drones)
-        # is_drone is col 4 of veh_feat
-        speed = 1.0 + veh_feat[:, :, 4]  # (B, 2K) 1.0 truck, 2.0 drone
-        arrival_approx = veh_time_frac + dist_approx / speed  # (B, 2K)
-
-        tw_close_exp = tw_close.unsqueeze(1).expand(B, V)  # (B, 2K)
-        tardiness = F.relu(arrival_approx - tw_close_exp)  # (B, 2K)
-
-        return dist_approx, arrival_approx, tardiness
 
     def _build_flat_logits(
         self,
-        logits_L1: torch.Tensor,  # (B, N+1)
-        static_emb: torch.Tensor,  # (B, N+1, D)
-        veh_emb: torch.Tensor,  # (B, 2K, D)
-        veh_feat: torch.Tensor,  # (B, 2K, VEH_FEAT_DIM)
+        logits_U: torch.Tensor,  # (B, N+1)
+        Z_node: torch.Tensor,  # (B, N+1, D)
+        graph_veh: torch.Tensor,  # (B, D)
+        Z_veh: torch.Tensor,  # (B, 2K, D)
         action_mask: Optional[torch.Tensor],
         N1: int,
-        V: int,
+        V2K: int,
+        device: str,
     ) -> torch.Tensor:
-        """
-        Build a flat (B, K*2*(N+1)) logit tensor from the two-level scores.
-        Used by evaluate_actions and the standard forward() path.
-
-        flat[b, fleet*(2*N1) + vtype*N1 + node] = logit_L1[node] + logit_L2[vehicle]
-        """
-        B = logits_L1.shape[0]
-        device = logits_L1.device
-
-        flat = torch.full((B, V // 2 * 2 * N1), float("-inf"), device=device)
+        B = logits_U.shape[0]
+        flat = torch.full((B, N1 * V2K), float("-inf"), device=logits_U.device)
 
         for n in range(N1):
-            target_emb = static_emb[:, n, :]  # (B, D)
-            node_id_t = torch.full((B,), n, dtype=torch.long, device=device)
-
+            Z_n = Z_node[:, n, :]  # (B, D)
+            v_mask = None
             if action_mask is not None:
-                veh_mask = self._vehicle_level_mask(action_mask, node_id_t, N1, V)
-            else:
-                veh_mask = None
-
-            dist_t, arr_t, tard_t = self._vehicle_scalars(
-                veh_feat, static_emb, node_id_t
-            )
-            l2 = self._decode_L2(
-                veh_emb, target_emb, dist_t, arr_t, tard_t, veh_mask
-            )  # (B,2K)
-
-            # Distribute to flat layout
-            for vid in range(V):
-                fleet = vid // 2
-                vtype = vid % 2
-                flat_i = fleet * (2 * N1) + vtype * N1 + n
-                # joint logit = L1(node) + L2(vehicle|node)
-                valid_L1 = logits_L1[:, n]
-                valid_L2 = l2[:, vid]
-                flat[:, flat_i] = valid_L1 + valid_L2
+                nid_t = torch.full((B,), n, dtype=torch.long, device=logits_U.device)
+                v_mask = self._lower_mask(action_mask, nid_t, N1, V2K)
+            l_L = self._decode_lower(graph_veh, Z_n, Z_veh, v_mask)  # (B, V2K)
+            for v in range(V2K):
+                flat[:, n * V2K + v] = logits_U[:, n] + l_L[:, v]
 
         if action_mask is not None:
             flat = flat.masked_fill(~action_mask, float("-inf"))
-
         return flat

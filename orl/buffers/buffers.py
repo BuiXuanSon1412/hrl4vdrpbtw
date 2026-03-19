@@ -1,28 +1,26 @@
 """
-buffers/
---------
-Experience storage, completely decoupled from agents and networks.
+buffers/buffers.py
+------------------
+Experience storage, decoupled from agents and networks.
 
-Buffers only need:
-  obs_shape        : to pre-allocate observation arrays
-  action_space_size: to pre-allocate action-mask arrays
-
-They do NOT know about networks, agents, or algorithms.
-
-Contents
---------
-  Transition    – named tuple for off-policy transitions
-  Batch         – dataclass for mini-batches (shared by on/off-policy)
-  ReplayBuffer  – uniform circular replay (DQN)
-  PrioritizedReplayBuffer – PER (DQN + PER)
-  RolloutBuffer – fixed-length on-policy rollout (PPO)
+Changes vs original
+-------------------
+- Batch: new optional field `graph_data: List[Dict]` for variable-length
+  graph observations (edge_index, edge_attr, edge_fleet per step).
+- RolloutBuffer: stores graph_data in a Python list alongside fixed arrays.
+  Fixed arrays cannot hold variable-E graph fields, so this is the only
+  clean solution without padding to a worst-case size.
+- RolloutBuffer.add(): optional `graph_data` kwarg.
+- RolloutBuffer.iter_batches(): includes graph_data slice per mini-batch.
+- RolloutBuffer.reset(): clears graph list.
+- Everything else (ReplayBuffer, PrioritizedReplayBuffer) unchanged.
 """
 
 from __future__ import annotations
 
 import numpy as np
-from dataclasses import dataclass
-from typing import Iterator, List, NamedTuple, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Iterator, List, NamedTuple, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +44,7 @@ class Batch:
 
     PPO-only fields are None for off-policy batches.
     PER-only fields  are None for uniform batches.
+    graph_data       is None when obs does not include graph fields.
     """
 
     obs: np.ndarray  # (B, *obs_shape)
@@ -62,8 +61,11 @@ class Batch:
     # PER
     weights: Optional[np.ndarray] = None  # (B,) importance weights
     indices: Optional[np.ndarray] = None  # (B,) buffer indices
-    # HACN (dict obs — vehicle features stored separately)
+    # HACN dict obs: vehicle features stored separately
     vehicle_features: Optional[np.ndarray] = None  # (B, 2K, VEH_FEAT_DIM)
+    # Variable-length graph fields (VRPBTW): list of per-step dicts
+    # Each dict has keys: "edge_index" (2,E), "edge_attr" (E,6), "edge_fleet" (E,)
+    graph_data: Optional[List[Dict]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -72,15 +74,7 @@ class Batch:
 
 
 class ReplayBuffer:
-    """
-    Circular replay buffer with uniform sampling.
-
-    Parameters
-    ----------
-    capacity         : Maximum number of transitions stored.
-    obs_shape        : Shape of a single observation (from problem.observation_shape).
-    action_space_size: From problem.action_space_size — used ONLY for mask storage.
-    """
+    """Circular replay buffer with uniform sampling."""
 
     def __init__(
         self,
@@ -113,9 +107,7 @@ class ReplayBuffer:
         self._size = min(self._size + 1, self.capacity)
 
     def sample(self, batch_size: int) -> Batch:
-        assert self._size >= batch_size, (
-            f"Buffer has {self._size} transitions; need {batch_size}."
-        )
+        assert self._size >= batch_size
         idx = np.random.randint(0, self._size, size=batch_size)
         return Batch(
             obs=self._obs[idx],
@@ -136,11 +128,7 @@ class ReplayBuffer:
 
 
 class PrioritizedReplayBuffer(ReplayBuffer):
-    """
-    Prioritised Experience Replay (Schaul et al. 2016).
-
-    Samples ∝ |TD error|^alpha; corrects bias with IS weights.
-    """
+    """Prioritised Experience Replay (Schaul et al. 2016)."""
 
     def __init__(
         self,
@@ -178,7 +166,6 @@ class PrioritizedReplayBuffer(ReplayBuffer):
             + self._beta_step * (self.beta_end - self.beta_start) / self.beta_steps,
         )
         self._beta_step += 1
-
         weights = (self._size * probs[idx]) ** (-beta)
         weights /= weights.max()
 
@@ -206,20 +193,18 @@ class RolloutBuffer:
     """
     Fixed-length rollout buffer for on-policy algorithms (PPO, A2C).
 
-    GAE advantage computation fix
-    ------------------------------
-    The original code had an off-by-one: it used done[t+1] to mask the
-    bootstrap at step t.  The correct mask is done[t] — if the episode
-    ended at step t, next_value should be 0.
+    Graph data handling
+    -------------------
+    edge_index / edge_attr / edge_fleet have variable length E per step.
+    They are stored in a Python list `_graph_data` of dicts rather than a
+    pre-allocated numpy array. When a batch is yielded, the corresponding
+    list slice is included as `batch.graph_data`.
 
-    Parameters
-    ----------
-    capacity         : Rollout length (steps per update).
-    obs_shape        : From problem.observation_shape.
-    action_space_size: From problem.action_space_size.
-    gamma            : Discount factor.
-    gae_lambda       : GAE smoothing parameter.
+    The primary obs array stores node_features (N+1, NODE_FEAT_DIM) as before.
+    vehicle_features are stored in `_vehicle_features` as before.
     """
+
+    normalize_advantages_flag: bool = True
 
     def __init__(
         self,
@@ -245,8 +230,11 @@ class RolloutBuffer:
         self._action_masks = np.ones((capacity, action_space_size), dtype=bool)
         self._advantages = np.zeros(capacity, dtype=np.float32)
         self._returns = np.zeros(capacity, dtype=np.float32)
-        # Optional: vehicle features for HACN decoder (None if not used)
+
+        # optional: vehicle features for HACN decoder (None if not used)
         self._vehicle_features: Optional[np.ndarray] = None
+        # variable-length graph data: list of dicts, one per step
+        self._graph_data: List[Optional[Dict]] = [None] * capacity
 
     def add(
         self,
@@ -258,7 +246,14 @@ class RolloutBuffer:
         value: float,
         action_mask: np.ndarray,
         vehicle_features: Optional[np.ndarray] = None,
+        graph_data: Optional[Dict] = None,
     ) -> None:
+        """
+        Parameters
+        ----------
+        graph_data : dict with keys 'edge_index', 'edge_attr', 'edge_fleet'
+                     (all numpy arrays). Pass None for non-graph problems.
+        """
         assert self._ptr < self.capacity, "RolloutBuffer is full; call reset()."
         i = self._ptr
         self._obs[i] = obs
@@ -268,33 +263,33 @@ class RolloutBuffer:
         self._log_probs[i] = log_prob
         self._values[i] = value
         self._action_masks[i] = action_mask
-        # Lazily allocate vehicle_features storage on first non-None call
+
         if vehicle_features is not None:
             if self._vehicle_features is None:
                 self._vehicle_features = np.zeros(
                     (self.capacity, *vehicle_features.shape), dtype=np.float32
                 )
             self._vehicle_features[i] = vehicle_features
+
+        # store graph data by reference (numpy arrays are cheap to store)
+        if graph_data is not None:
+            self._graph_data[i] = {
+                k: v.copy() if hasattr(v, "copy") else v for k, v in graph_data.items()
+            }
+        else:
+            self._graph_data[i] = None
+
         self._ptr += 1
 
     def compute_returns_and_advantages(self, last_value: float = 0.0) -> None:
-        """
-        Compute GAE-λ advantages and discounted returns.
-
-        Fix: done[t] is used to mask the bootstrap at step t,
-        NOT done[t+1] as the original code had.
-        """
+        """GAE-λ advantage computation. Fixed: done[t] masks bootstrap at t."""
         gae = 0.0
         n = self._ptr
         for t in reversed(range(n)):
-            # If this step ended an episode, the next state is from a new episode
-            # so next_value should be 0 and gae should reset.
             not_done = 1.0 - float(self._dones[t])
-            if t == n - 1:
-                next_value = last_value * not_done
-            else:
-                next_value = self._values[t + 1] * not_done
-
+            next_value = (
+                self._values[t + 1] * not_done if t < n - 1 else last_value * not_done
+            )
             delta = self._rewards[t] + self.gamma * next_value - self._values[t]
             gae = delta + self.gamma * self.gae_lambda * not_done * gae
             self._advantages[t] = gae
@@ -305,21 +300,24 @@ class RolloutBuffer:
             adv = self._advantages[:n]
             self._advantages[:n] = (adv - adv.mean()) / (adv.std() + 1e-8)
 
-    # Allow the caller to control normalisation
-    normalize_advantages_flag: bool = True
-
     def iter_batches(self, mini_batch_size: int, n_epochs: int = 1) -> Iterator[Batch]:
-        """Yield shuffled mini-batches over n_epochs."""
+        """Yield shuffled mini-batches. Includes graph_data when present."""
         n = self._ptr
+        has_graph = any(self._graph_data[i] is not None for i in range(n))
+
         for _ in range(n_epochs):
             idx = np.random.permutation(n)
             for start in range(0, n, mini_batch_size):
                 i = idx[start : start + mini_batch_size]
+
                 vf = (
                     self._vehicle_features[i]
                     if self._vehicle_features is not None
                     else None
                 )
+
+                gd = [self._graph_data[j] for j in i] if has_graph else None
+
                 yield Batch(
                     obs=self._obs[i],
                     actions=self._actions[i],
@@ -332,11 +330,13 @@ class RolloutBuffer:
                     advantages=self._advantages[i],
                     returns=self._returns[i],
                     vehicle_features=vf,
+                    graph_data=gd,
                 )
 
     def reset(self) -> None:
         self._ptr = 0
         self._vehicle_features = None
+        self._graph_data = [None] * self.capacity
 
     @property
     def is_full(self) -> bool:
