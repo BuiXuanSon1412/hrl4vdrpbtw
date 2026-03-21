@@ -1,465 +1,284 @@
-import torch
-import numpy as np
-from typing import Dict, Tuple
-import os
+"""
+train.py
+--------
+Single entry point for all experiments.
+
+This file is the only place that wires everything together:
+  1. Load / build ExperimentConfig
+  2. Seed everything
+  3. Build problem → env
+  4. Build network → agent  (shapes flow from problem)
+  5. Run Trainer.train()
+  6. Evaluate best checkpoint
+
+Usage
+-----
+# PPO on Knapsack (defaults)
+python train.py
+
+# DQN on Knapsack
+python train.py --algorithm dqn
+
+# PPO with pointer network on VRPBTW
+python train.py --problem vrpbtw --network pointer --steps 200000
+
+# Reproduce an existing experiment exactly
+python train.py --config checkpoints/my_exp_config.json
+
+# Evaluate only (no training)
+python train.py --eval-only checkpoints/my_exp_best.pt --config checkpoints/my_exp_config.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+# Make orl importable when run from the project root
+sys.path.insert(0, str(Path(__file__).parent))
+
+from config import ExperimentConfig, EnvConfig, NetworkConfig, PPOConfig, DQNConfig
+from config import TrainConfig, SeedConfig, load_config, save_config
+from utils import SeedManager
+from problems.registry import build_problem, get_generator
+from environments.combinatorial_env import Env
+from agents.registry import build_agent
+from trainer import Trainer, Evaluator
 
 
-from problem import CustomerType
-from environment import VehicleDroneRoutingEnv
-from agent import HierarchicalAgent
+# ---------------------------------------------------------------------------
+# Config builder from CLI args
+# ---------------------------------------------------------------------------
 
 
-def train_hrl_agent(
-    num_episodes: int = 1000,
-    batch_size: int = 32,
-    eval_interval: int = 50,
-    save_path: str = "hrl_checkpoint.pt",
-    # NEW: Reward normalization parameters
-    normalize_rewards: bool = True,
-    cost_weight: float = 0.5,
-    satisfaction_weight: float = 0.5,
-):
-    """
-    Main training loop with improved monitoring and normalized rewards
-    """
-    # Create environment with normalized rewards
-    env = VehicleDroneRoutingEnv(
-        num_customers=100,
-        num_vehicles=7,
-        num_drones=7,
-        normalize_rewards=normalize_rewards,
-        cost_weight=cost_weight,
-        satisfaction_weight=satisfaction_weight,
-    )
+def build_config(args: argparse.Namespace) -> ExperimentConfig:
+    """Build or load ExperimentConfig from CLI args."""
+    if args.config:
+        cfg = load_config(args.config)
+        # CLI overrides (explicit args take priority over file)
+        if args.algorithm:
+            cfg.algorithm = args.algorithm
+        if args.problem:
+            cfg.env.problem_name = args.problem
+        if args.network:
+            cfg.network.network_type = args.network
+        if args.steps:
+            cfg.train.total_timesteps = args.steps
+        if args.device:
+            cfg.device = args.device
+        return cfg
 
-    agent = HierarchicalAgent(env)
+    n_items = args.n_items or 20
+    n_cust = args.customers or 10
+    n_fleets = args.fleets or 2
 
-    # Training metrics
-    episode_rewards = []
-    episode_costs = []
-    episode_satisfactions = []
-    service_rates = []
+    problem_name = args.problem or "knapsack"
+    problem_kwargs = {}
+    if problem_name == "knapsack":
+        problem_kwargs = {"n_items": n_items}
+    elif problem_name == "vrpbtw":
+        problem_kwargs = {"n_customers": n_cust, "n_fleets": n_fleets}
 
-    print("Starting HRL Training...")
-    print(
-        f"Environment: {env.num_customers} customers, {env.num_vehicles} vehicles, {env.num_drones} drones"
-    )
-    print(f"Reward Normalization: {normalize_rewards}")
-    if normalize_rewards:
-        print(f"  Cost Weight: {cost_weight:.2f}")
-        print(f"  Satisfaction Weight: {satisfaction_weight:.2f}")
-        print(f"  Max Possible Cost: {env.max_possible_cost:.2f}")
-    print("=" * 80)
+    algorithm = args.algorithm or "ppo"
+    network = args.network or ("hacn" if problem_name == "vrpbtw" else "attention")
 
-    for episode in range(num_episodes):
-        # Generate solution (collect experience)
-        result = agent.generate_solution(training=True)
-
-        episode_rewards.append(result["total_reward"])
-        episode_costs.append(result["total_cost"])
-        episode_satisfactions.append(result["total_satisfaction"])
-        service_rates.append(result["service_rate"])
-
-        # Update exploration parameters
-        agent.update_exploration(episode, num_episodes)
-
-        # Train policies
-        if episode > 0 and episode % 5 == 0:
-            losses = agent.train_step(batch_size)
-
-            if losses and episode % 10 == 0:
-                print(
-                    f"Ep {episode}: "
-                    f"Served={result['customers_served']}/{env.num_customers} "
-                    f"({result['service_rate'] * 100:.1f}%), "
-                    f"Reward={result['total_reward']:.2f}, "
-                    f"Cost={result['total_cost']:.2f}, "
-                    f"Sat={result['total_satisfaction']:.2f}, "
-                    f"ε={agent.epsilon:.3f}, "
-                    f"T={agent.temperature:.2f}"
-                )
-
-        # Periodic evaluation
-        if episode > 0 and episode % eval_interval == 0:
-            print("\n" + "=" * 80)
-            print(f"EVALUATION at Episode {episode}")
-            print("=" * 80)
-
-            # Run evaluation episodes
-            eval_rewards = []
-            eval_costs = []
-            eval_satisfactions = []
-            eval_service_rates = []
-
-            for _ in range(10):
-                eval_result = agent.generate_solution(training=False)
-                eval_rewards.append(eval_result["total_reward"])
-                eval_costs.append(eval_result["total_cost"])
-                eval_satisfactions.append(eval_result["total_satisfaction"])
-                eval_service_rates.append(eval_result["service_rate"])
-
-            print(
-                f"Avg Service Rate: {np.mean(eval_service_rates) * 100:.1f}% ± {np.std(eval_service_rates) * 100:.1f}%"
-            )
-            print(
-                f"Avg Reward: {np.mean(eval_rewards):.2f} ± {np.std(eval_rewards):.2f}"
-            )
-            print(f"Avg Cost: {np.mean(eval_costs):.2f} ± {np.std(eval_costs):.2f}")
-            print(
-                f"Avg Satisfaction: {np.mean(eval_satisfactions):.2f} ± {np.std(eval_satisfactions):.2f}"
-            )
-
-            # Check if service rate is improving
-            if np.mean(eval_service_rates) < 0.9:
-                print(
-                    f"⚠️  WARNING: Low service rate ({np.mean(eval_service_rates) * 100:.1f}%)"
-                )
-            else:
-                print(f"✓ Good service rate!")
-
-            print("=" * 80 + "\n")
-
-            # Save checkpoint
-            agent.save(save_path)
-            print(f"Model saved to {save_path}\n")
-
-        # Clear buffers periodically
-        if episode > 0 and episode % 100 == 0:
-            agent.clear_buffers()
-
-            # Print training progress summary
-            recent_service_rates = service_rates[-100:]
-            print(
-                f"\n📊 Last 100 episodes avg service rate: {np.mean(recent_service_rates) * 100:.1f}%"
-            )
-
-    print("\nTraining completed!")
-
-    # Final statistics
-    print("\n" + "=" * 80)
-    print("TRAINING SUMMARY")
-    print("=" * 80)
-    print(
-        f"Final avg service rate (last 100 eps): {np.mean(service_rates[-100:]) * 100:.1f}%"
-    )
-    print(f"Best service rate achieved: {max(service_rates) * 100:.1f}%")
-    print(f"Episodes with 100% service: {sum(1 for sr in service_rates if sr >= 1.0)}")
-
-    return agent, {
-        "rewards": episode_rewards,
-        "costs": episode_costs,
-        "satisfactions": episode_satisfactions,
-        "service_rates": service_rates,
-    }
-
-
-def train_pareto_front(num_episodes: int = 500, batch_size: int = 32):
-    """
-    Train multiple agents with different cost/satisfaction weights
-    to explore the Pareto front
-    """
-    weight_configs = [
-        {"cost_weight": 0.9, "satisfaction_weight": 0.1, "name": "Cost-Prioritized"},
-        {"cost_weight": 0.7, "satisfaction_weight": 0.3, "name": "Cost-Focused"},
-        {"cost_weight": 0.5, "satisfaction_weight": 0.5, "name": "Balanced"},
-        {
-            "cost_weight": 0.3,
-            "satisfaction_weight": 0.7,
-            "name": "Satisfaction-Focused",
-        },
-        {
-            "cost_weight": 0.1,
-            "satisfaction_weight": 0.9,
-            "name": "Satisfaction-Prioritized",
-        },
-    ]
-
-    results = []
-
-    print("=" * 80)
-    print("PARETO FRONT EXPLORATION")
-    print("=" * 80)
-
-    for config in weight_configs:
-        print(f"\n{'=' * 80}")
-        print(f"Training: {config['name']}")
-        print(
-            f"Cost Weight: {config['cost_weight']:.1f}, Satisfaction Weight: {config['satisfaction_weight']:.1f}"
-        )
-        print(f"{'=' * 80}\n")
-
-        agent, history = train_hrl_agent(
-            num_episodes=num_episodes,
-            batch_size=batch_size,
-            eval_interval=100,
-            save_path=f"pareto_{config['name'].lower().replace('-', '_')}.pt",
+    cfg = ExperimentConfig(
+        name=args.name or f"{problem_name}_{algorithm}",
+        algorithm=algorithm,
+        device=args.device or "cpu",
+        seed=SeedConfig(global_seed=args.seed or 42),
+        env=EnvConfig(
+            problem_name=problem_name,
+            problem_kwargs=problem_kwargs,
+            max_steps=args.max_steps,
+            subtract_baseline=True,
+            dense_shaping=True,
+        ),
+        network=NetworkConfig(
+            network_type=network,
+            embed_dim=args.embed_dim or 128,
+            n_heads=8,
+            n_encoder_layers=3,
+        ),
+        ppo=PPOConfig(
+            lr=args.lr or 3e-4,
+            rollout_len=1024,
+            n_epochs=4,
+            entropy_coef=0.02,
             normalize_rewards=True,
-            cost_weight=config["cost_weight"],
-            satisfaction_weight=config["satisfaction_weight"],
-        )
-
-        # Final evaluation
-        stats, _ = evaluate_agent(agent, num_episodes=50)
-
-        results.append(
-            {
-                "name": config["name"],
-                "weights": (config["cost_weight"], config["satisfaction_weight"]),
-                "mean_cost": stats["mean_cost"],
-                "mean_satisfaction": stats["mean_satisfaction"],
-                "mean_service_rate": stats["mean_service_rate"],
-            }
-        )
-
-    # Print Pareto front summary
-    print("\n" + "=" * 80)
-    print("PARETO FRONT SUMMARY")
-    print("=" * 80)
-    print(
-        f"{'Configuration':<30} {'Cost Weight':<12} {'Sat Weight':<12} {'Avg Cost':<12} {'Avg Sat':<12} {'Service %':<10}"
+            normalize_advantages=True,
+        ),
+        dqn=DQNConfig(
+            lr=args.lr or 1e-4,
+            eps_decay_steps=50_000,
+        ),
+        train=TrainConfig(
+            total_timesteps=args.steps or 100_000,
+            log_interval=5,
+            eval_interval=20,
+            checkpoint_interval=100,
+            checkpoint_dir=args.checkpoint_dir or "checkpoints",
+            log_dir=args.log_dir or "logs",
+            patience=60,
+            n_eval_episodes=10,
+            curriculum=not args.no_curriculum,
+            curriculum_start=3,
+            curriculum_end=n_cust if problem_name == "vrpbtw" else n_items,
+            curriculum_steps=(args.steps or 100_000) // 2,
+        ),
     )
-    print("-" * 80)
-    for result in results:
-        print(
-            f"{result['name']:<30} "
-            f"{result['weights'][0]:<12.2f} "
-            f"{result['weights'][1]:<12.2f} "
-            f"{result['mean_cost']:<12.2f} "
-            f"{result['mean_satisfaction']:<12.2f} "
-            f"{result['mean_service_rate'] * 100:<10.1f}"
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="ORL — Combinatorial RL framework")
+
+    # Config file (overrides everything)
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to ExperimentConfig JSON. CLI args override fields.",
+    )
+
+    # Problem
+    parser.add_argument(
+        "--problem", type=str, default=None, choices=["knapsack", "vrpbtw"]
+    )
+    parser.add_argument("--n-items", type=int, default=None)
+    parser.add_argument("--customers", type=int, default=None)
+    parser.add_argument("--fleets", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+
+    # Algorithm & network
+    parser.add_argument("--algorithm", type=str, default=None, choices=["ppo", "dqn"])
+    parser.add_argument(
+        "--network",
+        type=str,
+        default=None,
+        choices=["attention", "pointer", "mlp", "hacn"],
+    )
+    parser.add_argument("--embed-dim", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+
+    # Training
+    parser.add_argument("--steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--no-curriculum", action="store_true")
+    parser.add_argument("--checkpoint-dir", type=str, default=None)
+    parser.add_argument("--log-dir", type=str, default=None)
+    parser.add_argument("--name", type=str, default=None)
+
+    # Evaluation
+    parser.add_argument("--beam", type=int, default=1)
+    parser.add_argument(
+        "--eval-only",
+        type=str,
+        default=None,
+        metavar="CHECKPOINT",
+        help="Skip training; load checkpoint and evaluate.",
+    )
+
+    args = parser.parse_args()
+    cfg = build_config(args)
+
+    # ── 1. Reproducibility ──────────────────────────────────────────────
+    seed_mgr = SeedManager(
+        global_seed=cfg.seed.global_seed,
+        env_seed=cfg.seed.env_seed,
+        data_seed=cfg.seed.data_seed,
+    )
+    seed_mgr.seed_everything()
+    data_rng = seed_mgr.make_data_rng()
+    print(f"  {seed_mgr}")
+
+    # ── 2. Problem + environment ─────────────────────────────────────────
+    problem = build_problem(cfg.env)
+    env = Env(problem, cfg.env)
+
+    # Instance generator uses the dedicated data RNG for reproducibility
+    _base_gen = get_generator(cfg.env)
+
+    def instance_generator(size: int = None, **kwargs):
+        kw = dict(cfg.env.problem_kwargs)
+        if size is not None:
+            # Curriculum: update the size-governing kwarg
+            if cfg.env.problem_name == "knapsack":
+                kw["n_items"] = size
+            elif cfg.env.problem_name == "vrpbtw":
+                kw["n_customers"] = size
+        kw["rng"] = data_rng
+        return _base_gen(**kw)
+
+    # Encode a dummy instance so problem knows obs/action shapes
+    dummy = instance_generator()
+    problem.encode_instance(dummy)
+
+    print(f"  Problem    : {problem}")
+    print(f"  Obs shape  : {problem.observation_shape}")
+    print(f"  Actions    : {problem.action_space_size}")
+
+    # ── 3. Agent (network injected via factory) ──────────────────────────
+    agent = build_agent(
+        obs_shape=problem.observation_shape,
+        action_space_size=problem.action_space_size,
+        cfg=cfg,
+    )
+    print(f"  Agent      : {agent}")
+
+    # ── 4. Eval-only mode ─────────────────────────────────────────────────
+    if args.eval_only:
+        print(f"\nLoading checkpoint: {args.eval_only}")
+        agent.load(args.eval_only)
+        evaluator = Evaluator(
+            agent=agent,
+            env=env,
+            n_episodes=20,
+            deterministic=True,
+            beam_width=args.beam,
         )
-
-    return results
-
-
-def evaluate_agent(
-    agent: HierarchicalAgent, num_episodes: int = 100
-) -> Tuple[Dict, Dict]:
-    """
-    Comprehensive evaluation of trained agent
-    """
-    results = {
-        "rewards": [],
-        "costs": [],
-        "satisfactions": [],
-        "service_rates": [],
-        "customers_served": [],
-    }
-
-    for _ in range(num_episodes):
-        result = agent.generate_solution(training=False)
-
-        results["rewards"].append(result["total_reward"])
-        results["costs"].append(result["total_cost"])
-        results["satisfactions"].append(result["total_satisfaction"])
-        results["service_rates"].append(result["service_rate"])
-        results["customers_served"].append(result["customers_served"])
-
-    # Compute statistics
-    stats = {
-        "mean_reward": np.mean(results["rewards"]),
-        "std_reward": np.std(results["rewards"]),
-        "mean_cost": np.mean(results["costs"]),
-        "std_cost": np.std(results["costs"]),
-        "mean_satisfaction": np.mean(results["satisfactions"]),
-        "std_satisfaction": np.std(results["satisfactions"]),
-        "mean_service_rate": np.mean(results["service_rates"]),
-        "std_service_rate": np.std(results["service_rates"]),
-        "avg_served": np.mean(results["customers_served"]),
-    }
-
-    return stats, results
-
-
-def visualize_solution(agent: HierarchicalAgent):
-    """
-    Visualize a single solution
-    """
-    try:
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-    except ImportError:
-        print("matplotlib not available for visualization")
+        stats = evaluator.evaluate(instance_generator)
+        print("\nEvaluation results:")
+        for k, v in stats.items():
+            print(f"  {k:<28}: {v:.4f}" if isinstance(v, float) else f"  {k:<28}: {v}")
         return
 
-    # Generate solution
-    agent.env.reset()
-    result = agent.generate_solution(training=False)
-
-    # Create plot
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
-
-    # Plot 1: Routes
-    ax1.set_title("Vehicle and Drone Routes", fontsize=14, fontweight="bold")
-    ax1.set_xlabel("X Coordinate")
-    ax1.set_ylabel("Y Coordinate")
-
-    # Plot depot
-    ax1.scatter(
-        agent.env.depot[0],
-        agent.env.depot[1],
-        c="red",
-        s=300,
-        marker="s",
-        label="Depot",
-        zorder=5,
+    # ── 5. Train ─────────────────────────────────────────────────────────
+    trainer = Trainer(
+        agent=agent,
+        env=env,
+        instance_generator=instance_generator,
+        cfg=cfg,
     )
+    summary = trainer.train()
 
-    # Plot customers
-    for customer in agent.env.customers:
-        if customer.id in agent.env.served_customers:
-            # Served customers
-            color = (
-                "blue" if customer.customer_type == CustomerType.LINEHAUL else "green"
-            )
-            marker = "o" if customer.customer_type == CustomerType.LINEHAUL else "^"
-        else:
-            # Unserved customers (in red)
-            color = "red"
-            marker = "x"
+    # ── 6. Load best and evaluate ─────────────────────────────────────────
+    best_ckpt = f"{cfg.train.checkpoint_dir}/{cfg.name}_best.pt"
+    try:
+        agent.load(best_ckpt)
+        print(f"\nLoaded best checkpoint: {best_ckpt}")
+    except Exception as e:
+        print(f"Could not load best checkpoint ({e}); using final weights.")
 
-        ax1.scatter(customer.x, customer.y, c=color, s=100, marker=marker, zorder=3)
-        ax1.text(customer.x + 2, customer.y + 2, f"{customer.id}", fontsize=8)
-
-    # Plot vehicle routes
-    colors_vehicles = ["purple", "orange", "brown", "pink", "cyan", "magenta", "yellow"]
-    for i, vehicle in enumerate(agent.env.vehicles):
-        if len(vehicle.route) > 0:
-            route_x = [agent.env.depot[0]]
-            route_y = [agent.env.depot[1]]
-
-            for customer_id in vehicle.route:
-                customer = agent.env.customers[customer_id]
-                route_x.append(customer.x)
-                route_y.append(customer.y)
-
-            route_x.append(agent.env.depot[0])
-            route_y.append(agent.env.depot[1])
-
-            ax1.plot(
-                route_x,
-                route_y,
-                c=colors_vehicles[i % len(colors_vehicles)],
-                linewidth=2,
-                alpha=0.6,
-                label=f"Vehicle {i}",
-            )
-
-    # Create legend
-    linehaul_patch = mpatches.Patch(color="blue", label="Linehaul (Served)")
-    backhaul_patch = mpatches.Patch(color="green", label="Backhaul (Served)")
-    unserved_patch = mpatches.Patch(color="red", label="Unserved")
-    ax1.legend(
-        handles=[linehaul_patch, backhaul_patch, unserved_patch], loc="upper right"
+    evaluator = Evaluator(
+        agent=agent,
+        env=env,
+        n_episodes=20,
+        deterministic=True,
+        beam_width=args.beam,
     )
-    ax1.grid(True, alpha=0.3)
-
-    # Plot 2: Metrics
-    ax2.set_title("Solution Metrics", fontsize=14, fontweight="bold")
-    ax2.axis("off")
-
-    service_rate = result["service_rate"] * 100
-
-    metrics_text = f"""
-    SOLUTION QUALITY
-    {"=" * 40}
-    
-    Service Rate: {service_rate:.1f}%
-    Customers Served: {result["customers_served"]} / {agent.env.num_customers}
-    
-    Total Reward: {result["total_reward"]:.2f}
-    Total Cost: {result["total_cost"]:.2f}
-    Total Satisfaction: {result["total_satisfaction"]:.2f}
-    Avg Satisfaction: {result["total_satisfaction"] / max(1, result["customers_served"]):.3f}
-    
-    REWARD CONFIGURATION
-    {"=" * 40}
-    Normalized: {agent.env.normalize_rewards}
-    Cost Weight: {agent.env.cost_weight:.2f}
-    Satisfaction Weight: {agent.env.satisfaction_weight:.2f}
-    
-    VEHICLE UTILIZATION
-    {"=" * 40}
-    """
-
-    for i, vehicle in enumerate(agent.env.vehicles):
-        metrics_text += f"\nVehicle {i}: {len(vehicle.route)} customers"
-        metrics_text += f" (Load: {vehicle.current_load:.1f}/{vehicle.capacity})"
-
-    ax2.text(
-        0.1,
-        0.5,
-        metrics_text,
-        fontsize=11,
-        family="monospace",
-        verticalalignment="center",
-    )
-
-    plt.tight_layout()
-    img_path = os.path.join(
-        os.path.dirname(__file__), "..", "img", "hrl_solution_visualization.png"
-    )
-    os.makedirs(os.path.dirname(img_path), exist_ok=True)
-    plt.savefig(os.path.abspath(img_path), dpi=150, bbox_inches="tight")
-
-    print("Visualization saved to 'hrl_solution_visualization.png'")
-    plt.show()
+    eval_stats = evaluator.evaluate(instance_generator)
+    print("\nFinal evaluation:")
+    for k, v in eval_stats.items():
+        print(f"  {k:<28}: {v:.4f}" if isinstance(v, float) else f"  {k:<28}: {v}")
 
 
 if __name__ == "__main__":
-    # Set random seeds for reproducibility
-    np.random.seed(42)
-    torch.manual_seed(42)
-
-    print("=" * 80)
-    print("HIERARCHICAL RL FOR VEHICLE-DRONE ROUTING WITH BACKHAULS")
-    print("WITH NORMALIZED MULTI-OBJECTIVE REWARDS")
-    print("=" * 80)
-    print()
-
-    # Choose training mode
-    mode = "single"  # Options: "single" or "pareto"
-
-    if mode == "single":
-        # Train single agent with balanced weights
-        agent, training_history = train_hrl_agent(
-            num_episodes=500,
-            batch_size=32,
-            eval_interval=50,
-            save_path="hrl_vdrpb_checkpoint.pt",
-            normalize_rewards=True,
-            cost_weight=0.5,
-            satisfaction_weight=0.5,
-        )
-
-        print("\n" + "=" * 80)
-        print("FINAL EVALUATION")
-        print("=" * 80)
-
-        # Final evaluation
-        stats, results = evaluate_agent(agent, num_episodes=100)
-
-        print("\nFinal Performance Statistics:")
-        print(
-            f"  Service Rate: {stats['mean_service_rate'] * 100:.1f}% ± {stats['std_service_rate'] * 100:.1f}%"
-        )
-        print(f"  Mean Reward: {stats['mean_reward']:.2f} ± {stats['std_reward']:.2f}")
-        print(f"  Mean Cost: {stats['mean_cost']:.2f} ± {stats['std_cost']:.2f}")
-        print(
-            f"  Mean Satisfaction: {stats['mean_satisfaction']:.2f} ± {stats['std_satisfaction']:.2f}"
-        )
-        print(
-            f"  Avg Customers Served: {stats['avg_served']:.1f} / {agent.env.num_customers}"
-        )
-
-        # Visualize a solution
-        print("\nGenerating visualization...")
-        visualize_solution(agent)
-
-    elif mode == "pareto":
-        # Explore Pareto front with different weight configurations
-        pareto_results = train_pareto_front(num_episodes=500, batch_size=32)
-
-    print("\n" + "=" * 80)
-    print("TRAINING COMPLETE!")
-    print("=" * 80)
+    main()

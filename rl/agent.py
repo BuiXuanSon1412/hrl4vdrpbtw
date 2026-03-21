@@ -1,523 +1,543 @@
-import torch
+"""
+agents/base_agent.py
+--------------------
+Abstract agent interface.
+
+Design principles
+-----------------
+- Agents hold a network (injected, not built internally).
+- Shapes (obs_shape, action_space_size) come from the problem, passed at
+  construction time — not from the network.
+- Both on-policy (PPO) and off-policy (DQN) agents expose collect() and
+  update() so the Trainer never needs isinstance checks.
+- Algorithm logic lives in algorithms/ not here.  Agents are thin shells
+  that own state (network, buffer, optimizer) and delegate compute to
+  algorithm objects.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+import dataclasses
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
 import numpy as np
+import torch
+import torch.optim as optim
+
+from config import PPOConfig
+from module import BaseNetwork
+from utils import RunningNormalizer
+
+import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional
 
-from module import (
-    create_low_level_policy,
-    create_high_level_policy,
-)
+from core import RolloutBuffer, Batch
 
 
-class HierarchicalAgent:
+class BaseAgent(ABC):
     """
-    Hierarchical RL agent combining high-level and low-level policies
+    Minimal interface all RL agents must implement.
+
+    Constructor contract
+    --------------------
+    Every concrete agent must accept:
+        network          : BaseNetwork  — injected, not built internally
+        obs_shape        : Tuple        — from problem.observation_shape
+        action_space_size: int          — from problem.action_space_size
+        cfg              : algorithm-specific config dataclass
+
+    The agent should NOT build the network, normalise rewards itself
+    (delegate to RunningNormalizer), or know about problem instances.
     """
 
+    # ------------------------------------------------------------------
+    # Action selection (inference interface)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def select_action(
+        self,
+        obs: np.ndarray,
+        action_mask: np.ndarray,
+        training: bool = True,
+    ) -> Tuple[int, float, float]:
+        """
+        Select an action for the current state.
+
+        Parameters
+        ----------
+        obs         : Observation array, shape obs_shape.
+        action_mask : Boolean array (action_space_size,), True=feasible.
+        training    : If False, always deterministic.
+
+        Returns
+        -------
+        action   : int   — selected action index
+        log_prob : float — log-probability (0.0 for DQN)
+        value    : float — critic estimate (0.0 for DQN)
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Experience collection  (training interface)
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def collect(self, env: Any, instance_generator: Any) -> Dict[str, float]:
+        """
+        Collect experience from the environment.
+
+        On-policy  (PPO): fills rollout buffer, returns rollout statistics.
+        Off-policy (DQN): runs one episode, stores transitions, returns stats.
+
+        Returns
+        -------
+        stats : Dict of metric name → value for logging.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Learning update
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def update(self) -> Optional[Dict[str, float]]:
+        """
+        Perform one learning update.
+
+        On-policy  (PPO): runs n_epochs over rollout buffer.
+        Off-policy (DQN): samples batch from replay and does one gradient step.
+
+        Returns
+        -------
+        metrics : Dict of training metrics, or None if no update was performed.
+        """
+        ...
+
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        """
+        Save all state needed to fully resume training.
+
+        Must include:
+          - network weights
+          - optimizer state
+          - any running statistics (reward normalizer, etc.)
+          - step count
+          - the NetworkConfig (so the checkpoint is self-contained)
+        """
+        ...
+
+    @abstractmethod
+    def load(self, path: str) -> None:
+        """Restore agent state from a checkpoint."""
+        ...
+
+
+"""
+agents/ppo_agent.py
+--------------------
+PPO agent — supports flat array obs (Knapsack), dict obs (VRPBTW without
+graph), and dict obs with graph fields (VRPBTW with GNN vehicle embedder).
+
+Key changes vs original
+------------------------
+- collect(): extracts edge_index/edge_attr/edge_fleet from info when
+  present and stores them as graph_data in the rollout buffer.
+- update() / _build_obs_for_update(): reconstructs the full obs dict
+  (including graph fields) from the batch before calling ppo_update.
+- select_action(): obs dict is passed directly to the network as-is;
+  graph fields are already present in the dict from state_to_obs.
+- _pad_to / _pad_mask helpers unchanged.
+- vehicle_features handling unchanged.
+"""
+
+
+# ---------------------------------------------------------------------------
+# Padding helpers (unchanged)
+# ---------------------------------------------------------------------------
+
+
+def _pad_to(arr: np.ndarray, target_shape: tuple) -> np.ndarray:
+    if arr.shape == target_shape:
+        return arr
+    out = np.zeros(target_shape, dtype=arr.dtype)
+    slices = tuple(slice(0, s) for s in arr.shape)
+    out[slices] = arr
+    return out
+
+
+def _pad_mask(mask: np.ndarray, target_size: int) -> np.ndarray:
+    if mask.shape[0] == target_size:
+        return mask
+    out = np.zeros(target_size, dtype=bool)
+    out[: mask.shape[0]] = mask
+    return out
+
+
+class PPOAgent(BaseAgent):
     def __init__(
         self,
-        env,
-        high_level_lr: float = 3e-4,
-        low_level_lr: float = 3e-4,
-        gamma: float = 0.99,
-        embedding_dim: int = 128,
-        num_layers: int = 3,
-        head_num: int = 8,
-        qkv_dim: int = 16,
-        ff_hidden_dim: int = 512,
-        entropy_coef: float = 0.01,
-        epsilon_start: float = 1.0,
-        epsilon_end: float = 0.05,
-        epsilon_decay: float = 0.995,
-        temperature_start: float = 2.0,
-        temperature_end: float = 0.5,
-        temperature_decay: float = 0.995,
+        network: BaseNetwork,
+        obs_shape: Tuple[int, ...],
+        action_space_size: int,
+        cfg: PPOConfig,
+        device: str = "cpu",
     ):
-        self.env = env
-        self.gamma = gamma
-        self.embedding_dim = embedding_dim
-        self.entropy_coef = entropy_coef
+        self.network = network
+        self.obs_shape = obs_shape
+        self.action_space_size = action_space_size
+        self.cfg = cfg
+        self.device = device
 
-        # Exploration parameters
-        self.epsilon = epsilon_start
-        self.epsilon_start = epsilon_start
-        self.epsilon_end = epsilon_end
-        self.epsilon_decay = epsilon_decay
+        self.optimizer = optim.Adam(self.network.parameters(), lr=cfg.lr)
 
-        self.temperature = temperature_start
-        self.temperature_start = temperature_start
-        self.temperature_end = temperature_end
-        self.temperature_decay = temperature_decay
-
-        # Enhanced high-level policy
-        state_dim = env.observation_space.shape[0]
-        self.high_level_policy = create_high_level_policy(
-            state_dim=state_dim,
-            num_vehicles=env.num_vehicles,
-            embedding_dim=embedding_dim,
-            head_num=head_num,
-            qkv_dim=qkv_dim,
-            ff_hidden_dim=ff_hidden_dim,
+        self.rollout_buffer = RolloutBuffer(
+            capacity=cfg.rollout_len,
+            obs_shape=obs_shape,
+            action_space_size=action_space_size,
+            gamma=cfg.gamma,
+            gae_lambda=cfg.gae_lambda,
         )
-        self.high_level_optimizer = torch.optim.Adam(
-            self.high_level_policy.parameters(), lr=high_level_lr
-        )
+        self.rollout_buffer.normalize_advantages_flag = cfg.normalize_advantages
 
-        # Enhanced low-level policy
-        self.low_level_policy = create_low_level_policy(
-            customer_dim=7,
-            vehicle_dim=6,
-            num_customers=env.num_customers,
-            embedding_dim=embedding_dim,
-            num_layers=num_layers,
-            head_num=head_num,
-            qkv_dim=qkv_dim,
-            ff_hidden_dim=ff_hidden_dim,
-            logit_clipping=10.0,
-        )
-        self.low_level_optimizer = torch.optim.Adam(
-            self.low_level_policy.parameters(), lr=low_level_lr
-        )
+        self.reward_normalizer = RunningNormalizer() if cfg.normalize_rewards else None
 
-        # Experience buffers
-        self.high_level_buffer = []
-        self.low_level_buffer = []
+        self._update_count = 0
+        self._step_count = 0
 
-        # Training statistics
-        self.train_stats = {
-            "high_level_losses": [],
-            "low_level_losses": [],
-            "entropy": [],
-        }
+    # ------------------------------------------------------------------
+    # Obs helpers
+    # ------------------------------------------------------------------
 
-    def update_exploration(self, episode: int, total_episodes: int):
-        """Update exploration parameters (epsilon and temperature)"""
-        # Decay epsilon
-        self.epsilon = max(
-            self.epsilon_end, self.epsilon_start * (self.epsilon_decay**episode)
-        )
+    def _to_tensor_obs(self, obs: Union[np.ndarray, Dict]) -> Any:
+        if isinstance(obs, dict):
+            return {
+                k: torch.FloatTensor(v).to(self.device)
+                for k, v in obs.items()
+                if isinstance(v, np.ndarray)
+            }
+        return torch.FloatTensor(obs).to(self.device)
 
-        # Decay temperature
-        self.temperature = max(
-            self.temperature_end,
-            self.temperature_start * (self.temperature_decay**episode),
-        )
+    def _batch_obs(self, obs: Union[np.ndarray, Dict]) -> Any:
+        if isinstance(obs, dict):
+            return {k: v[None] for k, v in obs.items()}
+        return obs[None]
 
-    def select_vehicle(self, state: np.ndarray, training: bool = True) -> int:
-        """High-level decision: select which vehicle to plan"""
-        with torch.no_grad():
-            state_tensor = torch.FloatTensor(state).unsqueeze(0)
-            vehicle_logits, _ = self.high_level_policy(state_tensor)
+    # ------------------------------------------------------------------
+    # Inference
+    # ------------------------------------------------------------------
 
-            if training:
-                # Epsilon-greedy exploration
-                if np.random.random() < self.epsilon:
-                    vehicle_id = int(np.random.randint(0, self.env.num_vehicles))
-                else:
-                    # Sample with temperature
-                    dist = torch.distributions.Categorical(
-                        logits=vehicle_logits / self.temperature
-                    )
-                    vehicle_id = int(dist.sample().item())
-            else:
-                vehicle_id = int(vehicle_logits.argmax(dim=1).item())
-
-        return vehicle_id
-
-    def select_customer(
+    def select_action(
         self,
-        customer_features: np.ndarray,
-        vehicle_context: np.ndarray,
-        valid_actions: List[int],
+        obs: Union[np.ndarray, Dict],
+        action_mask: np.ndarray,
         training: bool = True,
-    ) -> Tuple[int, bool]:
-        """
-        Low-level decision: select customer and drone usage
-        Enhanced with attention-based encoding
-        """
-        # Set model to eval mode to avoid InstanceNorm issues with batch_size=1
-        was_training = self.low_level_policy.training
-        self.low_level_policy.eval()
-
-        # Create mask for invalid actions
-        mask = torch.ones(self.env.num_customers, dtype=torch.bool)
-        mask[valid_actions] = False
-
+    ) -> Tuple[int, float, float]:
         with torch.no_grad():
-            customer_tensor = torch.FloatTensor(customer_features).unsqueeze(0)
-            context_tensor = torch.FloatTensor(vehicle_context).unsqueeze(0)
+            obs_t = self._to_tensor_obs(self._batch_obs(obs))
+            mask_t = torch.BoolTensor(action_mask).unsqueeze(0).to(self.device)
+            action_t, lp_t, val_t = self.network.get_action_and_log_prob(
+                obs_t, mask_t, deterministic=not training
+            )
+        return int(action_t.item()), float(lp_t.item()), float(val_t.item())
 
-            customer_logits, drone_logits, _ = self.low_level_policy(
-                customer_tensor, context_tensor, mask.unsqueeze(0)
+    # ------------------------------------------------------------------
+    # Experience collection
+    # ------------------------------------------------------------------
+
+    def collect(self, env: Any, instance_generator: Callable) -> Dict[str, float]:
+        self.rollout_buffer.reset()
+
+        ep_rewards: List[float] = []
+        ep_lengths: List[int] = []
+        ep_reward, ep_length = 0.0, 0
+
+        raw = instance_generator()
+        obs, info = env.reset(raw)
+        action_mask = info["action_mask"]
+
+        while not self.rollout_buffer.is_full:
+            action, log_prob, value = self.select_action(
+                obs, action_mask, training=True
+            )
+            next_obs, reward, terminated, truncated, info = env.step(action)
+
+            if self.reward_normalizer is not None:
+                reward = self.reward_normalizer.normalise(reward)
+
+            # ── obs storage ──────────────────────────────────────────
+            if isinstance(obs, dict):
+                obs_to_store = _pad_to(obs["node_features"], self.obs_shape)
+                veh_to_store = obs.get("vehicle_features")
+
+                # graph fields — variable length, stored as dict
+                graph_to_store: Optional[Dict] = None
+                if "edge_index" in obs:
+                    graph_to_store = {
+                        "edge_index": obs["edge_index"].copy(),
+                        "edge_attr": obs["edge_attr"].copy(),
+                        "edge_fleet": obs["edge_fleet"].copy(),
+                    }
+            else:
+                obs_to_store = obs
+                veh_to_store = None
+                graph_to_store = None
+
+            mask_to_store = _pad_mask(action_mask, self.action_space_size)
+
+            self.rollout_buffer.add(
+                obs=obs_to_store,
+                action=action,
+                reward=reward,
+                done=(terminated or truncated),
+                log_prob=log_prob,
+                value=value,
+                action_mask=mask_to_store,
+                vehicle_features=veh_to_store,
+                graph_data=graph_to_store,
             )
 
-            if training:
-                # Epsilon-greedy + temperature sampling
-                if np.random.random() < self.epsilon or len(valid_actions) == 0:
-                    # Random valid customer
-                    customer_id = (
-                        int(np.random.choice(valid_actions))
-                        if len(valid_actions) > 0
-                        else 0
-                    )
-                    use_drone = bool(np.random.randint(0, 2))
-                else:
-                    # Extract logits for valid actions
-                    valid_logits = customer_logits[0][valid_actions]
+            self._step_count += 1
+            ep_reward += reward
+            ep_length += 1
+            obs = next_obs
+            action_mask = info["action_mask"]
 
-                    # Check for invalid values (inf, -inf, nan)
-                    if torch.any(torch.isnan(valid_logits)) or torch.any(
-                        torch.isinf(valid_logits)
-                    ):
-                        # Fallback to random selection if logits are invalid
-                        customer_id = int(np.random.choice(valid_actions))
-                    else:
-                        # Apply temperature and softmax
-                        valid_logits_temp = valid_logits / self.temperature
+            if terminated or truncated:
+                ep_rewards.append(ep_reward)
+                ep_lengths.append(ep_length)
+                ep_reward, ep_length = 0.0, 0
+                raw = instance_generator()
+                obs, info = env.reset(raw)
+                action_mask = info["action_mask"]
 
-                        # Clamp logits to prevent overflow in softmax
-                        valid_logits_temp = torch.clamp(
-                            valid_logits_temp, min=-50, max=50
-                        )
-
-                        valid_probs = F.softmax(valid_logits_temp, dim=0)
-
-                        # Final check: ensure probs are valid
-                        if torch.any(torch.isnan(valid_probs)) or not torch.isfinite(
-                            valid_probs.sum()
-                        ):
-                            customer_id = int(np.random.choice(valid_actions))
-                        else:
-                            # Sample from valid actions
-                            valid_dist = torch.distributions.Categorical(valid_probs)
-                            sampled_idx = int(valid_dist.sample().item())
-                            customer_id = valid_actions[sampled_idx]
-
-                    # Drone decision
-                    drone_logits_temp = torch.clamp(
-                        drone_logits / self.temperature, min=-50, max=50
-                    )
-                    drone_probs = F.softmax(drone_logits_temp, dim=1)
-
-                    if torch.any(torch.isnan(drone_probs)):
-                        use_drone = bool(np.random.randint(0, 2))
-                    else:
-                        drone_dist = torch.distributions.Categorical(drone_probs)
-                        use_drone = bool(drone_dist.sample().item())
-            else:
-                # Greedy selection - choose best from valid actions
-                if len(valid_actions) > 0:
-                    valid_logits = customer_logits[0][valid_actions]
-
-                    # Handle invalid logits
-                    if torch.any(torch.isnan(valid_logits)) or torch.all(
-                        torch.isinf(valid_logits)
-                    ):
-                        customer_id = valid_actions[0]  # Pick first valid action
-                    else:
-                        best_valid_idx = int(valid_logits.argmax().item())
-                        customer_id = valid_actions[best_valid_idx]
-                else:
-                    customer_id = 0  # Fallback
-
-                use_drone = bool(drone_logits.argmax(dim=1).item())
-
-        # Restore training mode if it was on
-        if was_training:
-            self.low_level_policy.train()
-
-        return customer_id, use_drone
-
-    def generate_solution(self, training: bool = True) -> Dict:
-        """
-        Auto-regressive solution generation
-        """
-        # Set models to eval mode during solution generation to avoid batch norm issues
-        self.high_level_policy.eval()
-        self.low_level_policy.eval()
-
-        state, _ = self.env.reset()
-        terminated = False
-        truncated = False
-        episode_reward = 0.0
-        steps = 0
-
-        while not (terminated or truncated) and steps < self.env.num_customers * 2:
-            # High-level: select vehicle
-            vehicle_id = self.select_vehicle(state, training)
-
-            # Get valid actions for this vehicle
-            valid_actions = self.env.get_valid_actions(vehicle_id)
-
-            customer_features: Optional[np.ndarray] = None
-            vehicle_context: Optional[np.ndarray] = None
-
-            if len(valid_actions) == 1 and valid_actions[0] == -1:
-                # Only depot return available
-                customer_id = -1
-                use_drone = False
-            else:
-                # Extract features for low-level policy
-                customer_features = self._extract_customer_features(state)
-                vehicle_context = self._extract_vehicle_context(state, vehicle_id)
-
-                # Low-level: select customer and drone usage
-                customer_id, use_drone = self.select_customer(
-                    customer_features, vehicle_context, valid_actions, training
-                )
-
-            # Execute action
-            action = {
-                "vehicle_id": vehicle_id,
-                "customer_id": customer_id,
-                "use_drone": use_drone,
-                "drone_id": 0 if use_drone else None,
-            }
-
-            next_state, reward, terminated, truncated, info = self.env.step(action)
-
-            # Store experience
-            if training:
-                self.high_level_buffer.append(
-                    {
-                        "state": state,
-                        "vehicle_id": vehicle_id,
-                        "reward": reward,
-                        "next_state": next_state,
-                        "done": terminated or truncated,
-                    }
-                )
-
-                self.low_level_buffer.append(
-                    {
-                        "customer_features": customer_features
-                        if customer_id != -1
-                        else None,
-                        "vehicle_context": vehicle_context
-                        if customer_id != -1
-                        else None,
-                        "customer_id": customer_id,
-                        "use_drone": use_drone,
-                        "reward": reward,
-                        "done": terminated or truncated,
-                    }
-                )
-
-            episode_reward += reward
-            state = next_state
-            steps += 1
-
-        # Calculate service rate
-        customers_served = len(self.env.served_customers)
-        service_rate = customers_served / self.env.num_customers
+        # bootstrap value for GAE
+        _, _, last_value = self.select_action(obs, action_mask, training=False)
+        self.rollout_buffer.compute_returns_and_advantages(last_value=last_value)
 
         return {
-            "total_reward": episode_reward,
-            "total_cost": self.env.total_cost,
-            "total_satisfaction": self.env.total_satisfaction,
-            "steps": steps,
-            "customers_served": customers_served,
-            "service_rate": service_rate,
+            "rollout/mean_reward": float(np.mean(ep_rewards)) if ep_rewards else 0.0,
+            "rollout/mean_ep_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
+            "rollout/n_episodes": len(ep_rewards),
+            "rollout/steps": self.rollout_buffer.capacity,
         }
 
-    def _extract_customer_features(self, state: np.ndarray) -> np.ndarray:
-        """Extract customer features from state"""
-        start_idx = 2
-        end_idx = 2 + self.env.num_customers * 7
-        customer_data = state[start_idx:end_idx].reshape(self.env.num_customers, 7)
-        return customer_data
+    # ------------------------------------------------------------------
+    # Learning update
+    # ------------------------------------------------------------------
 
-    def _extract_vehicle_context(
-        self, state: np.ndarray, vehicle_id: int
-    ) -> np.ndarray:
-        """Extract vehicle context from state"""
-        start_idx = 2 + self.env.num_customers * 7 + vehicle_id * 6
-        end_idx = start_idx + 6
-        return state[start_idx:end_idx]
-
-    def train_step(self, batch_size: int = 32) -> Dict:
-        """
-        Enhanced training step with entropy regularization
-        """
-        if (
-            len(self.high_level_buffer) < batch_size
-            or len(self.low_level_buffer) < batch_size
-        ):
-            return {}
-
-        # Set models to training mode
-        self.high_level_policy.train()
-        self.low_level_policy.train()
-
-        # Train high-level policy
-        high_level_loss, high_level_entropy = self._train_high_level(batch_size)
-
-        # Train low-level policy
-        low_level_loss, low_level_entropy = self._train_low_level(batch_size)
-
-        # Update statistics
-        self.train_stats["high_level_losses"].append(high_level_loss)
-        self.train_stats["low_level_losses"].append(low_level_loss)
-        self.train_stats["entropy"].append(low_level_entropy)
-
-        return {
-            "high_level_loss": high_level_loss,
-            "high_level_entropy": high_level_entropy,
-            "low_level_loss": low_level_loss,
-            "low_level_entropy": low_level_entropy,
-        }
-
-    def _train_high_level(self, batch_size: int) -> Tuple[float, float]:
-        """Train high-level policy using policy gradient with entropy regularization"""
-        # Sample batch
-        indices = np.random.choice(
-            len(self.high_level_buffer), batch_size, replace=False
+    def update(self) -> Optional[Dict[str, float]]:
+        self.network.train()
+        metrics = ppo_update(
+            network=self.network,
+            optimizer=self.optimizer,
+            buffer=self.rollout_buffer,
+            cfg=self.cfg,
+            device=self.device,
         )
-        batch = [self.high_level_buffer[i] for i in indices]
+        self._update_count += 1
+        metrics["train/update_count"] = self._update_count
+        return metrics
 
-        states = torch.FloatTensor([exp["state"] for exp in batch])
-        vehicle_ids = torch.LongTensor([exp["vehicle_id"] for exp in batch])
-        rewards = torch.FloatTensor([exp["reward"] for exp in batch])
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
 
-        # Forward pass
-        vehicle_logits, values = self.high_level_policy(states)
+    def save(self, path: str, extra: Optional[Dict] = None) -> None:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "network_state": self.network.state_dict(),
+            "optimizer_state": self.optimizer.state_dict(),
+            "ppo_cfg": dataclasses.asdict(self.cfg),
+            "obs_shape": self.obs_shape,
+            "action_space_size": self.action_space_size,
+            "update_count": self._update_count,
+            "step_count": self._step_count,
+            "reward_norm": (
+                self.reward_normalizer.state_dict() if self.reward_normalizer else None
+            ),
+        }
+        if extra:
+            payload.update(extra)
+        torch.save(payload, path)
 
-        # Calculate advantages
-        advantages = rewards - values.squeeze()
+    def load(self, path: str) -> None:
+        ckpt = torch.load(path, map_location=self.device)
+        self.network.load_state_dict(ckpt["network_state"])
+        self.optimizer.load_state_dict(ckpt["optimizer_state"])
+        self._update_count = ckpt.get("update_count", 0)
+        self._step_count = ckpt.get("step_count", 0)
+        if self.reward_normalizer and ckpt.get("reward_norm"):
+            self.reward_normalizer.load_state_dict(ckpt["reward_norm"])
 
-        # Policy loss
-        log_probs = F.log_softmax(vehicle_logits, dim=1)
-        selected_log_probs = log_probs.gather(1, vehicle_ids.unsqueeze(1)).squeeze()
-        policy_loss = -(selected_log_probs * advantages.detach()).mean()
+    def __repr__(self) -> str:
+        return (
+            f"PPOAgent(obs={self.obs_shape}, actions={self.action_space_size}, "
+            f"updates={self._update_count}, device={self.device!r})"
+        )
 
-        # Entropy bonus for exploration
-        probs = F.softmax(vehicle_logits, dim=1)
-        entropy = -(probs * log_probs).sum(dim=1).mean()
-        entropy_loss = -self.entropy_coef * entropy
 
-        # Value loss
-        value_loss = F.mse_loss(values.squeeze(), rewards)
+"""
+algorithms/ppo.py
+-----------------
+PPO-clip algorithm: pure compute, no state, no env, no agent coupling.
 
-        # Total loss
-        loss = policy_loss + entropy_loss + 0.5 * value_loss
+Changes vs original
+-------------------
+- _build_obs(): new helper that reconstructs the full obs dict from a batch,
+  including graph fields from batch.graph_data when present.
+  For VRPBTW: obs = {
+      "node_features":    (B, N+1, D)   from batch.obs
+      "vehicle_features": (B, 2K, Dv)   from batch.vehicle_features
+      "edge_index":       list[B] of (2, E_b)   from batch.graph_data
+      "edge_attr":        list[B] of (E_b, 6)
+      "edge_fleet":       list[B] of (E_b,)
+  }
+  For flat obs (Knapsack): obs = batch.obs tensor directly.
+"""
 
-        # Backprop
-        self.high_level_optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.high_level_policy.parameters(), 1.0)
-        self.high_level_optimizer.step()
 
-        return loss.item(), entropy.item()
+# ---------------------------------------------------------------------------
+# Obs reconstruction helper
+# ---------------------------------------------------------------------------
 
-    def _train_low_level(self, batch_size: int) -> Tuple[float, float]:
-        """Train low-level policy using policy gradient with entropy regularization"""
-        # Sample batch (filter out depot returns)
-        valid_experiences = [
-            exp for exp in self.low_level_buffer if exp["customer_features"] is not None
+
+def _build_obs(batch: Batch, device: str) -> Union[torch.Tensor, Dict]:
+    """
+    Reconstruct the obs format the network expects from a stored batch.
+
+    - Flat obs (no vehicle_features, no graph_data): return FloatTensor
+    - Dict obs without graph: {"node_features", "vehicle_features"}
+    - Dict obs with graph:    {"node_features", "vehicle_features",
+                                "edge_index", "edge_attr", "edge_fleet"}
+      graph fields stay as Python lists of numpy arrays — the network's
+      _prep_batch() handles list-of-arrays correctly.
+    """
+    if batch.vehicle_features is None and batch.graph_data is None:
+        # plain flat obs (Knapsack)
+        return torch.FloatTensor(batch.obs).to(device)
+
+    obs: Dict = {
+        "node_features": torch.FloatTensor(batch.obs).to(device),
+    }
+
+    if batch.vehicle_features is not None:
+        obs["vehicle_features"] = torch.FloatTensor(batch.vehicle_features).to(device)
+
+    if batch.graph_data is not None:
+        # keep as list — network's _prep_batch handles it
+        obs["edge_index"] = [
+            (gd["edge_index"] if gd is not None else np.zeros((2, 0), dtype=np.int32))
+            for gd in batch.graph_data
+        ]
+        obs["edge_attr"] = [
+            (gd["edge_attr"] if gd is not None else np.zeros((0, 6), dtype=np.float32))
+            for gd in batch.graph_data
+        ]
+        obs["edge_fleet"] = [
+            (gd["edge_fleet"] if gd is not None else np.zeros(0, dtype=np.int32))
+            for gd in batch.graph_data
         ]
 
-        if len(valid_experiences) < batch_size:
-            return 0.0, 0.0
+    return obs
 
-        indices = np.random.choice(len(valid_experiences), batch_size, replace=False)
-        batch = [valid_experiences[i] for i in indices]
 
-        customer_features = torch.FloatTensor(
-            [exp["customer_features"] for exp in batch]
-        )
-        vehicle_contexts = torch.FloatTensor([exp["vehicle_context"] for exp in batch])
-        customer_ids = torch.LongTensor([exp["customer_id"] for exp in batch])
-        use_drones = torch.LongTensor([int(exp["use_drone"]) for exp in batch])
-        rewards = torch.FloatTensor([exp["reward"] for exp in batch])
+# ---------------------------------------------------------------------------
+# PPO update
+# ---------------------------------------------------------------------------
 
-        # Create dummy masks for training (all actions valid during training)
-        mask = torch.zeros(batch_size, self.env.num_customers, dtype=torch.bool)
 
-        # Forward pass
-        customer_logits, drone_logits, values = self.low_level_policy(
-            customer_features, vehicle_contexts, mask
-        )
+def ppo_update(
+    network: BaseNetwork,
+    optimizer: torch.optim.Optimizer,
+    buffer: RolloutBuffer,
+    cfg: PPOConfig,
+    device: str,
+) -> Dict[str, float]:
+    """
+    Run cfg.n_epochs of PPO-clip updates on the current rollout buffer.
+    """
+    network.train()
 
-        # Calculate advantages
-        advantages = rewards - values.squeeze()
+    total = dict(
+        policy_loss=0.0,
+        value_loss=0.0,
+        entropy=0.0,
+        approx_kl=0.0,
+        grad_norm=0.0,
+        explained_var=0.0,
+    )
+    n_updates = 0
+    early_stop = False
 
-        # Customer selection loss
-        customer_log_probs = F.log_softmax(customer_logits, dim=1)
-        selected_customer_log_probs = customer_log_probs.gather(
-            1, customer_ids.unsqueeze(1)
-        ).squeeze()
-        customer_policy_loss = -(
-            selected_customer_log_probs * advantages.detach()
-        ).mean()
+    for batch in buffer.iter_batches(cfg.mini_batch_size, n_epochs=cfg.n_epochs):
+        if early_stop:
+            break
 
-        # Customer entropy for exploration
-        customer_probs = F.softmax(customer_logits, dim=1)
-        customer_entropy = -(customer_probs * customer_log_probs).sum(dim=1).mean()
+        obs_t = _build_obs(batch, device)
+        acts_t = torch.LongTensor(batch.actions).to(device)
+        masks_t = torch.BoolTensor(batch.action_masks).to(device)
+        adv_t = torch.FloatTensor(batch.advantages).to(device)
+        ret_t = torch.FloatTensor(batch.returns).to(device)
+        old_lp_t = torch.FloatTensor(batch.log_probs).to(device)
 
-        # Drone usage loss
-        drone_log_probs = F.log_softmax(drone_logits, dim=1)
-        selected_drone_log_probs = drone_log_probs.gather(
-            1, use_drones.unsqueeze(1)
-        ).squeeze()
-        drone_policy_loss = -(selected_drone_log_probs * advantages.detach()).mean()
+        new_lp, values, entropy = network.evaluate_actions(obs_t, acts_t, masks_t)
 
-        # Drone entropy for exploration
-        drone_probs = F.softmax(drone_logits, dim=1)
-        drone_entropy = -(drone_probs * drone_log_probs).sum(dim=1).mean()
+        # clipped surrogate objective
+        ratio = torch.exp(new_lp - old_lp_t)
+        surr1 = ratio * adv_t
+        surr2 = torch.clamp(ratio, 1 - cfg.clip_eps, 1 + cfg.clip_eps) * adv_t
+        policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Combined entropy
-        total_entropy = customer_entropy + drone_entropy
-        entropy_loss = -self.entropy_coef * total_entropy
+        value_loss = 0.5 * F.mse_loss(values, ret_t)
+        entropy_loss = -entropy.mean()
 
-        # Value loss
-        value_loss = F.mse_loss(values.squeeze(), rewards)
-
-        # Total loss
         loss = (
-            customer_policy_loss
-            + 0.5 * drone_policy_loss
-            + entropy_loss
-            + 0.5 * value_loss
+            policy_loss + cfg.value_coef * value_loss + cfg.entropy_coef * entropy_loss
         )
 
-        # Backprop
-        self.low_level_optimizer.zero_grad()
+        optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.low_level_policy.parameters(), 1.0)
-        self.low_level_optimizer.step()
+        grad_norm = nn.utils.clip_grad_norm_(network.parameters(), cfg.max_grad_norm)
+        optimizer.step()
 
-        return loss.item(), total_entropy.item()
+        with torch.no_grad():
+            approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
 
-    def clear_buffers(self):
-        """Clear experience buffers"""
-        self.high_level_buffer = []
-        self.low_level_buffer = []
+        total["policy_loss"] += policy_loss.item()
+        total["value_loss"] += value_loss.item()
+        total["entropy"] += (-entropy_loss).item()
+        total["approx_kl"] += approx_kl
+        total["grad_norm"] += float(grad_norm)
+        n_updates += 1
 
-    def save(self, path: str):
-        """Save model checkpoints"""
-        torch.save(
-            {
-                "high_level_state_dict": self.high_level_policy.state_dict(),
-                "low_level_state_dict": self.low_level_policy.state_dict(),
-                "high_level_optimizer": self.high_level_optimizer.state_dict(),
-                "low_level_optimizer": self.low_level_optimizer.state_dict(),
-                "train_stats": self.train_stats,
-                "epsilon": self.epsilon,
-                "temperature": self.temperature,
-            },
-            path,
-        )
+        if cfg.target_kl is not None and approx_kl > 1.5 * cfg.target_kl:
+            early_stop = True
 
-    def load(self, path: str):
-        """Load model checkpoints"""
-        checkpoint = torch.load(path)
-        self.high_level_policy.load_state_dict(checkpoint["high_level_state_dict"])
-        self.low_level_policy.load_state_dict(checkpoint["low_level_state_dict"])
-        self.high_level_optimizer.load_state_dict(checkpoint["high_level_optimizer"])
-        self.low_level_optimizer.load_state_dict(checkpoint["low_level_optimizer"])
-        if "train_stats" in checkpoint:
-            self.train_stats = checkpoint["train_stats"]
-        if "epsilon" in checkpoint:
-            self.epsilon = checkpoint["epsilon"]
-        if "temperature" in checkpoint:
-            self.temperature = checkpoint["temperature"]
+    # explained variance from full buffer
+    n_steps = buffer._ptr
+    if n_steps > 0:
+        y_true = buffer._returns[:n_steps]
+        y_pred = buffer._values[:n_steps]
+        var_y = np.var(y_true)
+        ev = float(1.0 - np.var(y_true - y_pred) / (var_y + 1e-8))
+        total["explained_var"] = ev
+
+    n = max(n_updates, 1)
+    return {
+        "train/policy_loss": total["policy_loss"] / n,
+        "train/value_loss": total["value_loss"] / n,
+        "train/entropy": total["entropy"] / n,
+        "train/approx_kl": total["approx_kl"] / n,
+        "train/grad_norm": total["grad_norm"] / n,
+        "train/explained_var": total.get("explained_var", float("nan")),
+        "train/early_stop": float(early_stop),
+        "train/n_updates": float(n_updates),
+    }
