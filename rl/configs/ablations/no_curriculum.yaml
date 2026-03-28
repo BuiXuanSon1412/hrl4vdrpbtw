@@ -1,0 +1,11 @@
+# configs/ablations/no_curriculum.yaml
+# ------------------------------------
+# Ablation: disable curriculum scheduling.
+# Run with:
+#   python train.py --config configs/base.yaml \
+#                   --override configs/ablations/no_curriculum.yaml
+
+name: vrpbtw_ppo_no_curriculum
+
+train:
+  curriculum: false

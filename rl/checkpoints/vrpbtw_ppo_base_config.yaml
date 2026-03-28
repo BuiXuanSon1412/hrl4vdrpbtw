@@ -1,0 +1,59 @@
+name: vrpbtw_ppo_base
+algorithm: ppo
+device: cpu
+seed:
+  global_seed: 42
+  env_seed: null
+  data_seed: null
+env:
+  problem_name: vrpbtw
+  problem_kwargs:
+    n_customers: 10
+    n_fleets: 2
+  max_steps: null
+  reward_scale: 1.0
+  subtract_baseline: true
+  dense_shaping: true
+network:
+  network_type: hacn
+  embed_dim: 128
+  n_heads: 4
+  n_encoder_layers: 3
+  dropout: 0.1
+  clip_logits: 10.0
+  ortho_init: true
+  use_instance_norm: true
+  hidden_dims:
+  - 256
+  - 256
+ppo:
+  lr: 0.0002
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_eps: 0.2
+  value_coef: 0.5
+  entropy_coef: 0.02
+  max_grad_norm: 0.5
+  n_epochs: 4
+  mini_batch_size: 128
+  rollout_len: 1024
+  target_kl: 0.02
+  normalize_advantages: true
+  normalize_rewards: true
+  reward_norm_eps: 1.0e-08
+train:
+  total_timesteps: 500000
+  log_interval: 5
+  eval_interval: 20
+  checkpoint_interval: 100
+  checkpoint_dir: checkpoints
+  log_dir: logs
+  patience: 80
+  min_delta: 0.0001
+  n_eval_episodes: 10
+  eval_deterministic: true
+  eval_beam_width: 1
+  curriculum: true
+  curriculum_start: 3
+  curriculum_end: 10
+  curriculum_steps: 150000

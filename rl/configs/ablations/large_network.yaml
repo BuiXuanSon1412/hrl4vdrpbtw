@@ -1,0 +1,13 @@
+# configs/ablations/large_network.yaml
+# -------------------------------------
+# Ablation: double embedding dimension and add one encoder layer.
+# Run with:
+#   python train.py --config configs/base.yaml \
+#                   --override configs/ablations/large_network.yaml
+
+name: vrpbtw_ppo_large_net
+
+network:
+  embed_dim:        256
+  n_heads:          8
+  n_encoder_layers: 4

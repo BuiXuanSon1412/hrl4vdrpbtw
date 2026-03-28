@@ -1,25 +1,29 @@
 """
-configs/base_config.py
-----------------------
-Centralised, fully-serialisable experiment configuration.
+config.py
+---------
+Experiment configuration: dataclasses + YAML/JSON serialisation.
 
-Design principles
------------------
-- Every hyperparameter lives in exactly ONE dataclass.
-- Configs are plain Python dataclasses so they serialise to/from JSON/YAML
-  with zero external dependencies.
-- NetworkConfig owns architecture; AlgorithmConfig owns learning;
-  TrainConfig owns loop logistics.  They are never mixed.
-- The top-level ExperimentConfig is the single object passed to Trainer.
-  Passing it to `agent.save()` lets checkpoints be self-contained.
+Structure
+---------
+Each component has its own dataclass.  ExperimentConfig composes them.
+YAML is the preferred hand-edited format; JSON is used for machine-written
+checkpoint configs.  Both directions are supported transparently via the
+file extension.
 
-Usage
------
-from configs.base_config import ExperimentConfig, load_config, save_config
+Ablation / multi-file workflow
+------------------------------
+For ablation studies, keep one base config and small override files:
 
-cfg = ExperimentConfig()            # sensible defaults
-cfg = load_config("cfg.json")       # from file
-save_config(cfg, "cfg.json")        # to file
+    python train.py --config configs/base.yaml --override configs/ablations/no_curriculum.yaml
+
+merge_configs(base_path, override_path) loads and deep-merges two files.
+Only keys present in the override file are changed; everything else keeps
+the base value.  This is cleaner than duplicating full config files.
+
+Dependencies
+------------
+  pyyaml   pip install pyyaml
+  json     stdlib
 """
 
 from __future__ import annotations
@@ -28,78 +32,46 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # ---------------------------------------------------------------------------
-# Seed / reproducibility
+# Component dataclasses
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class SeedConfig:
-    """Reproducibility settings."""
-
     global_seed: int = 42
-    env_seed: Optional[int] = None  # None → derive from global_seed
-    data_seed: Optional[int] = None  # None → derive from global_seed
-
-
-# ---------------------------------------------------------------------------
-# Problem / environment
-# ---------------------------------------------------------------------------
+    env_seed: Optional[int] = None  # None → derived from global_seed
+    data_seed: Optional[int] = None  # None → derived from global_seed
 
 
 @dataclass
-class EnvConfig:
-    """Environment and problem settings."""
-
-    problem_name: str = "knapsack"  # registered name in ENV_REGISTRY
+class EnvironmentConfig:
+    problem_name: str = "vrpbtw"
     problem_kwargs: Dict[str, Any] = field(default_factory=dict)
-    max_steps: Optional[int] = None  # hard episode truncation
+    max_steps: Optional[int] = None
     reward_scale: float = 1.0
     subtract_baseline: bool = False
     dense_shaping: bool = True
 
 
-# ---------------------------------------------------------------------------
-# Network architecture
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class NetworkConfig:
-    """
-    Neural network architecture hyperparameters.
-
-    These describe the MODEL.  No algorithm-specific fields belong here.
-    """
-
-    network_type: str = "attention"  # "attention" | "pointer" | "mlp"
+    network_type: str = "hacn"
     embed_dim: int = 128
     n_heads: int = 8
     n_encoder_layers: int = 3
     dropout: float = 0.0
     clip_logits: float = 10.0
     ortho_init: bool = True
-    use_instance_norm: bool = True  # True=InstanceNorm (paper), False=LayerNorm
-    # MLP-only
+    use_instance_norm: bool = True
     hidden_dims: List[int] = field(default_factory=lambda: [256, 256])
-
-
-# ---------------------------------------------------------------------------
-# Algorithm hyperparameters — one per algorithm, no mixing
-# ---------------------------------------------------------------------------
 
 
 @dataclass
 class PPOConfig:
-    """
-    PPO-specific hyperparameters only.
-
-    No network fields.  No environment fields.
-    """
-
     lr: float = 3e-4
     gamma: float = 0.99
     gae_lambda: float = 0.95
@@ -110,7 +82,7 @@ class PPOConfig:
     n_epochs: int = 4
     mini_batch_size: int = 256
     rollout_len: int = 2048
-    target_kl: Optional[float] = 0.015  # None → disable KL early-stop
+    target_kl: Optional[float] = 0.015
     normalize_advantages: bool = True
     normalize_rewards: bool = True
     reward_norm_eps: float = 1e-8
@@ -118,14 +90,12 @@ class PPOConfig:
 
 @dataclass
 class DQNConfig:
-    """DQN-specific hyperparameters only."""
-
     lr: float = 1e-4
     gamma: float = 0.99
     buffer_capacity: int = 100_000
     batch_size: int = 64
     target_update_freq: int = 500
-    tau: float = 1.0  # 1.0 = hard copy; <1.0 = soft
+    tau: float = 1.0
     train_freq: int = 4
     learning_starts: int = 1_000
     eps_start: float = 1.0
@@ -138,106 +108,199 @@ class DQNConfig:
     per_beta_steps: int = 100_000
 
 
-# ---------------------------------------------------------------------------
-# Training loop
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class TrainConfig:
-    """
-    Training loop logistics — completely independent of the algorithm.
-    """
-
     total_timesteps: int = 1_000_000
-    log_interval: int = 10  # log every N iterations
-    eval_interval: int = 50  # evaluate every N iterations
-    checkpoint_interval: int = 250  # save periodic snapshot every N iters
+    log_interval: int = 10
+    eval_interval: int = 50
+    checkpoint_interval: int = 250
     checkpoint_dir: str = "checkpoints"
     log_dir: str = "logs"
-    # Early stopping
-    patience: int = 100  # evals without improvement
+    patience: int = 100
     min_delta: float = 1e-4
-    # Evaluation
     n_eval_episodes: int = 20
     eval_deterministic: bool = True
     eval_beam_width: int = 1
-    # Curriculum
     curriculum: bool = False
     curriculum_start: int = 5
     curriculum_end: int = 50
     curriculum_steps: int = 500_000
 
 
-# ---------------------------------------------------------------------------
-# Top-level experiment config
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class ExperimentConfig:
-    """
-    Single object capturing a complete, reproducible experiment.
-
-    Pass this to Trainer.  Save it alongside checkpoints.
-    """
+    """Single object capturing a complete, reproducible experiment."""
 
     name: str = "experiment"
-    algorithm: str = "ppo"  # "ppo" | "dqn"
+    algorithm: str = "ppo"
+    device: str = "cpu"
     seed: SeedConfig = field(default_factory=SeedConfig)
-    env: EnvConfig = field(default_factory=EnvConfig)
+    env: EnvironmentConfig = field(default_factory=EnvironmentConfig)
     network: NetworkConfig = field(default_factory=NetworkConfig)
     ppo: PPOConfig = field(default_factory=PPOConfig)
     dqn: DQNConfig = field(default_factory=DQNConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    device: str = "cpu"
 
 
 # ---------------------------------------------------------------------------
-# Serialisation helpers
+# Serialisation
 # ---------------------------------------------------------------------------
 
 
 def config_to_dict(cfg: Any) -> Dict:
-    """Recursively convert dataclass to plain dict."""
     return dataclasses.asdict(cfg)
 
 
-def config_from_dict(d: Dict, cls) -> Any:
-    """Recursively reconstruct dataclass from plain dict."""
+def _from_dict(d: Dict, cls: type) -> Any:
+    """
+    Reconstruct a dataclass from a plain dict.
+    Unknown keys are silently ignored → forward-compatible with new fields.
+    """
     import typing
 
     hints = typing.get_type_hints(cls)
-    kwargs = {}
-    for f in dataclasses.fields(cls):
-        if f.name in d:
-            val = d[f.name]
+    fields = {f.name: f for f in dataclasses.fields(cls)}
+    kwargs: Dict[str, Any] = {}
+
+    for name, f in fields.items():
+        if name in d:
+            val = d[name]
         elif f.default is not dataclasses.MISSING:
             val = f.default
         elif f.default_factory is not dataclasses.MISSING:  # type: ignore[misc]
             val = f.default_factory()  # type: ignore[misc]
         else:
             raise ValueError(
-                f"No value or default for field {f.name!r} in {cls.__name__}"
+                f"Required field {name!r} missing in {cls.__name__} and has no default."
             )
-        actual_type = hints.get(f.name, None)
+        # Recurse into nested dataclasses
+        actual = hints.get(name)
         if (
-            actual_type
-            and dataclasses.is_dataclass(actual_type)
+            actual is not None
+            and isinstance(actual, type)
+            and dataclasses.is_dataclass(actual)
             and isinstance(val, dict)
         ):
-            val = config_from_dict(val, actual_type)
-        kwargs[f.name] = val
+            val = _from_dict(val, actual)
+
+        kwargs[name] = val
+
     return cls(**kwargs)
 
 
-def save_config(cfg: ExperimentConfig, path: str) -> None:
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
+# ---------------------------------------------------------------------------
+# File I/O
+# ---------------------------------------------------------------------------
+
+
+def _infer_format(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix in {".yaml", ".yml"}:
+        return "yaml"
+    if suffix == ".json":
+        return "json"
+    raise ValueError(
+        f"Cannot infer format from extension {suffix!r}.  Use .yaml, .yml, or .json."
+    )
+
+
+def _load_yaml(path: str) -> Dict:
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "pyyaml is required.  Install with:  pip install pyyaml"
+        ) from exc
+    with open(path) as fh:
+        return yaml.safe_load(fh) or {}
+
+
+def _dump_yaml(data: Dict, path: str) -> None:
+    try:
+        import yaml  # type: ignore
+    except ImportError as exc:
+        raise ImportError(
+            "pyyaml is required.  Install with:  pip install pyyaml"
+        ) from exc
     with open(path, "w") as fh:
-        json.dump(config_to_dict(cfg), fh, indent=2)
+        yaml.dump(data, fh, default_flow_style=False, sort_keys=False, indent=2)
 
 
 def load_config(path: str) -> ExperimentConfig:
-    with open(path) as fh:
-        d = json.load(fh)
-    return config_from_dict(d, ExperimentConfig)
+    """
+    Load ExperimentConfig from a YAML or JSON file.
+    Missing fields fall back to dataclass defaults (forward-compatible).
+    """
+    fmt = _infer_format(path)
+    data = _load_yaml(path) if fmt == "yaml" else json.loads(Path(path).read_text())
+    return _from_dict(data, ExperimentConfig)
+
+
+def save_config(cfg: ExperimentConfig, path: str) -> None:
+    """
+    Save config to YAML or JSON.
+    YAML output omits the unused algorithm block (dqn when ppo, etc.)
+    to keep hand-edited files clean.  JSON always saves the full schema.
+    """
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    fmt = _infer_format(path)
+    data = config_to_dict(cfg)
+
+    if fmt == "yaml":
+        if cfg.algorithm == "ppo":
+            data.pop("dqn", None)
+        elif cfg.algorithm == "dqn":
+            data.pop("ppo", None)
+        _dump_yaml(data, path)
+    else:
+        Path(path).write_text(json.dumps(data, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Ablation helper: deep-merge two config dicts
+# ---------------------------------------------------------------------------
+
+
+def _deep_merge(base: Dict, override: Dict) -> Dict:
+    """
+    Recursively merge override into base.
+    Only keys present in override are modified; base keys not in override
+    are preserved unchanged.
+    """
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
+def merge_configs(
+    base_path: str,
+    override_path: str,
+) -> ExperimentConfig:
+    """
+    Load a base config and apply an override file on top of it.
+
+    Useful for ablation studies:
+        merge_configs("configs/base.yaml", "configs/ablations/no_curriculum.yaml")
+
+    The override file only needs to contain the keys you want to change.
+    """
+    fmt_b = _infer_format(base_path)
+    fmt_o = _infer_format(override_path)
+
+    base_data = (
+        _load_yaml(base_path)
+        if fmt_b == "yaml"
+        else json.loads(Path(base_path).read_text())
+    )
+    override_data = (
+        _load_yaml(override_path)
+        if fmt_o == "yaml"
+        else json.loads(Path(override_path).read_text())
+    )
+
+    merged = _deep_merge(base_data, override_data)
+    return _from_dict(merged, ExperimentConfig)

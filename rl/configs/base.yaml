@@ -1,0 +1,86 @@
+# =============================================================================
+# configs/base.yaml  —  Base experiment configuration
+# =============================================================================
+# This is the canonical starting point for all VRPBTW experiments.
+# For ablation studies, create a small override file and run:
+#
+#   python train.py --config configs/base.yaml \
+#                   --override configs/ablations/no_curriculum.yaml
+#
+# Only the keys you want to change need to appear in the override file.
+# =============================================================================
+name:      vrpbtw_ppo_base
+algorithm: ppo
+device:    cpu
+
+seed:
+  global_seed: 42
+  env_seed:    null
+  data_seed:   null
+
+env:
+  problem_name: vrpbtw
+  problem_kwargs:
+    n_customers: 10
+    n_fleets:    2
+  max_steps:         null
+  reward_scale:      1.0
+  subtract_baseline: true
+  dense_shaping:     true
+
+network:
+  network_type:      hacn
+  embed_dim:         128
+  n_heads:           4          # reduced from 8 — the cross-attn in VehicleEncoder
+                                # runs on (2K=4) queries; 8 heads for 4 queries wastes
+                                # capacity and slows down without benefit
+  n_encoder_layers:  3
+  dropout:           0.1        # light dropout helps the bidirectional encoder
+                                # generalise across curriculum sizes
+  clip_logits:       10.0
+  ortho_init:        true
+  use_instance_norm: true
+  hidden_dims:       [256, 256]
+
+ppo:
+  lr:                   0.0002  # slightly lower than 3e-4 — the deeper encoder
+                                # has more parameters and benefits from a calmer LR
+  gamma:                0.99
+  gae_lambda:           0.95
+  clip_eps:             0.2
+  value_coef:           0.5
+  entropy_coef:         0.02    # keep exploration high early; the type-conditioned
+                                # decoder can collapse quickly to one vehicle type
+  max_grad_norm:        0.5
+  n_epochs:             4
+  mini_batch_size:      128     # smaller than 256 — the bidirectional encoder is
+                                # 2-3× more compute per sample; 128 keeps iteration
+                                # time reasonable on CPU
+  rollout_len:          1024
+  target_kl:            0.02    # slightly looser than 0.015 — early curriculum
+                                # episodes are short and KL can spike; give it room
+  normalize_advantages: true
+  normalize_rewards:    true
+  reward_norm_eps:      1.0e-8
+
+train:
+  total_timesteps:     500000   # the hierarchical encoder needs more steps to
+                                # learn the bidirectional node↔vehicle coupling;
+                                # 100k is too few for meaningful convergence
+  log_interval:        5
+  eval_interval:       20
+  checkpoint_interval: 100
+  checkpoint_dir:      checkpoints
+  log_dir:             logs
+  patience:            80       # more patience — the bidirectional pass causes
+                                # noisy early evaluation scores
+  min_delta:           0.0001
+  n_eval_episodes:     10
+  eval_deterministic:  true
+  eval_beam_width:     1
+  curriculum:          true
+  curriculum_start:    3
+  curriculum_end:      10
+  curriculum_steps:    150000   # ramp over 30% of total budget rather than 50%
+                                # of the old 100k; gives the network time to
+                                # stabilise on each curriculum size
