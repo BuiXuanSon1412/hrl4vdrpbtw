@@ -315,6 +315,24 @@ class Environment(ABC):
         """Optional baseline objective (used for reward shaping)."""
         return None
 
+    def get_candidate_starts(self) -> List[Tuple[Any, Dict[str, Any], Dict[str, Any]]]:
+        """
+        Return a list of candidate starting states for POMO or other multi-start algorithms.
+
+        Called AFTER encode_instance(). Each tuple is (state, obs, info) where info contains
+        'action_mask' and 'feasible_actions'.
+
+        Default: raises NotImplementedError. Concrete envs override this for algorithms
+        that benefit from multiple starting points (POMO, symmetry breaking, etc.).
+
+        Returns
+        -------
+        list of (state, obs, info) tuples for each candidate start configuration.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} must implement get_candidate_starts() for POMO"
+        )
+
     @property
     def n_steps(self) -> int:
         return self._n_steps

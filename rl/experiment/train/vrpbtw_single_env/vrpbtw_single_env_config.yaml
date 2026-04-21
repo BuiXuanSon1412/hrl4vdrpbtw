@@ -1,0 +1,67 @@
+experiment:
+  name: vrpbtw_single_env
+  description: 'Single-environment training on VRPBTW (100 nodes). Simplest baseline:
+    one fixed environment, PPO gradient updates.
+
+    '
+  tags:
+  - single-env
+  - ppo
+  - vrpbtw
+  - baseline
+reproducibility:
+  seed:
+    global_seed: 42
+    env_seed: null
+    data_seed: null
+  device: cpu
+environment:
+  problem:
+    name: vrpbtw
+    kwargs:
+      linehaul_ratio: 0.5
+      generator_seed_offset: 100000
+      lambda_weight: 1.0
+  reward:
+    scale: 1.0
+    max_episode_length: null
+  problem_size: 10
+network:
+  type: hgnn
+  backbone:
+    embedding_dim: 128
+    n_heads: 4
+    n_encoder_layers: 3
+  regularization:
+    dropout: 0.1
+    use_instance_norm: true
+    ortho_init: true
+  decoder:
+    clip_logits: 10.0
+rl_objective:
+  gamma: 0.99
+  gae_lambda: 0.95
+  value_coefficient: 0.5
+  entropy_coefficient: 0.02
+  normalize_advantages: true
+  normalize_rewards: true
+training:
+  total_timesteps: 1000000
+  learning_rate: 0.001
+  rollout_length: 50
+  logging:
+    log_interval: 5
+    eval_interval: 20
+    checkpoint_interval: 100
+    checkpoint_dir: experiment/train
+    log_dir: experiment/train/logs
+  early_stopping:
+    patience: 150
+    min_delta: 0.0001
+    metric: mean_objective
+evaluation:
+  n_episodes: 20
+  deterministic: true
+  decoding:
+    strategy: greedy
+    beam_width: 1

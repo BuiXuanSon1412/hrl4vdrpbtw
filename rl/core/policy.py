@@ -1,5 +1,5 @@
 """
-core/module.py
+core/policy.py
 --------------
 Abstract base class for all policy + value networks, plus the
 shared neural network sub-modules reused across architectures.
@@ -13,10 +13,6 @@ What lives here
   _InstanceNormWrapper — InstanceNorm1d with the sequence-dim swap
   _make_norm           — factory: InstanceNorm or LayerNorm by flag
 
-What does NOT live here
------------------------
-  Concrete network architectures (PolicyNetwork)        → networks/hgnn.py
-  Problem-specific constants (NODE_FEAT_DIM etc.)       → problems/vrpbtw.py
 """
 
 from __future__ import annotations
@@ -189,6 +185,21 @@ class BasePolicy(nn.Module, ABC):
         entropy   : (B,) float32
         """
         ...
+
+    def compute_entropy(self, buffer) -> float:
+        """
+        Compute policy entropy on buffer data for curriculum monitoring.
+
+        Default implementation returns 0.0; override in subclasses for
+        problem-specific entropy metrics.
+
+        Args:
+            buffer: RolloutBuffer with collected transitions
+
+        Returns:
+            scalar entropy value
+        """
+        return 0.0
 
     # ------------------------------------------------------------------
     # Shared helpers available to all subclasses

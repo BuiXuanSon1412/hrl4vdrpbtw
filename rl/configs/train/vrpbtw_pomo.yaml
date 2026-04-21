@@ -1,0 +1,197 @@
+# =============================================================================
+# configs/train/vrpbtw_pomo.yaml — Policy Optimization with Multiple Optima
+# =============================================================================
+# POMO training configuration for learning robust policies via multiple
+# starting point augmentation.
+#
+# Algorithm: POMO (Policy Optimization with Multiple Optima)
+# Training: Multiple starts → Independent rollouts → REINFORCE with shared baseline
+#
+# Workflow:
+#   1. Encode problem instance
+#   2. Call env.get_candidate_starts() to generate N starting states
+#      (For VRPBTW: truck 1 dispatched to each linehaul customer)
+#   3. Roll out N independent episodes from each starting point
+#   4. Compute advantage: A_i = R_i - mean(R_j)
+#   5. REINFORCE loss: -1/N * sum_i(A_i * sum(log_prob_ij))
+#   6. Gradient update
+#   7. Repeat until budget exhausted or early stopping
+#
+# Key insight: Multiple starting points provide richer signal and encourage
+# the policy to find good solutions regardless of starting configuration.
+#
+# =============================================================================
+
+# =============================================================================
+# Experiment Metadata & Reproducibility
+# =============================================================================
+name: vrpbtw_pomo
+
+experiment:
+  name: vrpbtw_pomo
+  description: >
+    Single-environment POMO training on VRPBTW.
+    Learns robust policy via multiple starting points (truck 1 to each linehaul customer).
+    Uses REINFORCE with shared baseline (mean reward across starts).
+    No task pool or curriculum — fixed problem size with stochastic instances.
+  tags: [pomo, single-environment, robust, vrpbtw, reinforce]
+
+reproducibility:
+  seed:
+    global_seed: 42             # Master seed (init everything)
+    env_seed: null              # null → derived from global
+    data_seed: null             # null → derived from global
+  device: cpu                   # cpu | cuda
+
+# =============================================================================
+# Environment & Problem Configuration
+# =============================================================================
+environment:
+  problem:
+    name: vrpbtw                # Vehicle Routing with Backhauls & Time Windows
+    kwargs:
+      linehaul_ratio: 0.5       # Fraction linehaul vs. backhaul
+      generator_seed_offset: 100000
+      lambda_weight: 1.0
+  reward:
+    scale: 1.0                  # Reward scaling
+    max_episode_length: null    # null = no limit
+
+  # Single fixed size (no task pool)
+  problem_size: 50              # Number of customers (fixed during training)
+
+# =============================================================================
+# Policy Network Architecture
+# =============================================================================
+network:
+  type: hgnn                    # Heterogeneous Graph Neural Network
+
+  backbone:
+    embedding_dim: 128          # Hidden embedding dimension
+    n_heads: 4                  # Multi-head attention heads
+    n_encoder_layers: 3         # Transformer encoder depth
+
+  regularization:
+    dropout: 0.1                # Dropout rate
+    use_instance_norm: true     # Instance normalization before activation
+    ortho_init: true            # Orthogonal weight initialization
+
+  decoder:
+    clip_logits: 10.0           # Tanh clipping range for stability
+
+# =============================================================================
+# RL Objective (REINFORCE with shared baseline)
+# =============================================================================
+rl_objective:
+  gamma: 0.99                   # Discount factor (for cumulative return)
+  gae_lambda: 0.95              # GAE-λ for advantage estimation (if used)
+  value_coefficient: 0.5        # Weight on value loss (if value network present)
+  entropy_coefficient: 0.02     # Entropy bonus (exploration regularization)
+  normalize_advantages: true    # Normalize advantages (A_i = R_i - baseline)
+  normalize_rewards: false      # Don't normalize raw rewards (preserve scale)
+
+# =============================================================================
+# POMO Algorithm Configuration
+# =============================================================================
+algorithm:
+  name: pomo
+
+  # Multiple optima: candidate starting points from env.get_candidate_starts()
+  # For VRPBTW: N candidates = N linehaul customers
+  #   Candidate_i: truck 1 dispatched to linehaul customer i
+  #   Remaining fleets/customers handled by policy
+  multiple_starts:
+    enabled: true               # Use env.get_candidate_starts()
+    # Note: For VRPBTW with ~50% linehaul, expect ~25 starting points
+
+  # REINFORCE baseline: mean reward across all starting points
+  baseline:
+    strategy: mean              # mean = average reward; alternatives: min, percentile
+    reduction: mean_over_starts # Compute once per instance
+
+  # Entropy regularization
+  entropy:
+    coefficient: 0.02           # Entropy bonus weight
+    decay: 1.0                  # Multiply entropy_coef by this each 1M steps
+
+# =============================================================================
+# Training Loop Configuration
+# =============================================================================
+learning_rate: 0.001            # Adam learning rate
+
+training:
+  # Training budget
+  total_timesteps: 1_000_000     # Total environment steps (shorter than MAML)
+
+  # Rollout collection
+  rollout_length: 256            # Unused for POMO (full episodes collected)
+
+  # Logging & checkpointing
+  logging:
+    log_interval: 5              # Log every N iterations
+    eval_interval: 20            # Evaluate every N iterations
+    checkpoint_interval: 100     # Save checkpoint every N iterations
+    checkpoint_dir: experiment/train
+    log_dir: experiment/train/logs
+
+  # Early stopping
+  early_stopping:
+    patience: 150                # Stop after N evals without improvement
+    min_delta: 0.0001            # Minimum improvement to reset patience
+    metric: mean_objective
+
+# =============================================================================
+# POMO-Specific Parameters
+# =============================================================================
+pomo:
+  # Batch size: number of problem instances per gradient update
+  n_instances_per_update: 4      # Collect 4 instances per iteration
+                                  # Each instance generates N*4 trajectories
+                                  # (N = number of candidate starts)
+
+  # Gradient stabilization
+  max_grad_norm: 0.5             # Clip gradients to this norm
+  entropy_coef: 0.02             # Entropy regularization (duplicate; see rl_objective)
+
+# =============================================================================
+# Evaluation Configuration
+# =============================================================================
+evaluation:
+  n_episodes: 20                 # Fresh instances per eval
+  deterministic: true            # Greedy (no sampling) during eval
+
+  decoding:
+    strategy: greedy             # greedy | beam
+    beam_width: 1                # Beam width (1 = greedy)
+
+# =============================================================================
+# Usage
+# =============================================================================
+#
+# Train with POMO (multiple optima):
+#   python train.py --config configs/train/vrpbtw_pomo.yaml
+#
+# Override specific values:
+#   python train.py --config configs/train/vrpbtw_pomo.yaml --name my_pomo_50node
+#   python train.py --config configs/train/vrpbtw_pomo.yaml --device cuda
+#   python train.py --config configs/train/vrpbtw_pomo.yaml --override configs/overrides/pomo_large_batch.yaml
+#
+# Outputs: experiment/train/vrpbtw_pomo/
+#   ├── vrpbtw_pomo_config.yaml  (saved config snapshot)
+#   ├── vrpbtw_pomo_best.pt      (best policy weights)
+#   ├── vrpbtw_pomo_final.pt     (final policy weights)
+#   └── logs/
+#       └── vrpbtw_pomo.jsonl    (training metrics: pomo_loss, episode_return, eval scores)
+#
+# Key Differences from MAML:
+#   - Single environment (no task pool)
+#   - Multiple starts per instance (not multiple tasks)
+#   - REINFORCE loss instead of PPO
+#   - Shared baseline = mean reward across starts
+#   - Encourages robust solutions (work well from any starting point)
+#
+# When to use POMO vs MAML:
+#   - POMO: Single fixed problem size, maximize robustness to symmetries
+#   - MAML: Multiple problem sizes, maximize generalization to new sizes
+#
+# =============================================================================

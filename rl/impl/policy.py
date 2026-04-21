@@ -47,7 +47,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from core.module import BasePolicy, _MHA, _FF, _make_norm
+from core.policy import BasePolicy, _MHA, _FF, _make_norm
 from impl.environment import NODE_FEAT_DIM, VEH_FEAT_DIM
 
 GRAPH_EDGE_DIM = 2  # [cost, time]
@@ -310,7 +310,8 @@ class NodeDecoder(nn.Module):
     ) -> torch.Tensor:
         if self._scale is None:
             self._scale = math.sqrt(Z_node.shape[-1])
-        ctx = self.ctx_proj(torch.cat([g_node, Z_veh.mean(1), g_graph], dim=-1))
+        z_veh_mean = Z_veh.mean(1)
+        ctx = self.ctx_proj(torch.cat([g_node, z_veh_mean, g_graph], dim=-1))
         Q = self.Wq(ctx).unsqueeze(1)
         logits = torch.bmm(Q, self.Wk(Z_node).transpose(1, 2)).squeeze(1) / self._scale
         logits = self.clip * torch.tanh(logits)
@@ -338,7 +339,8 @@ class VehicleDecoder(nn.Module):
     ) -> torch.Tensor:
         if self._scale is None:
             self._scale = math.sqrt(Z_veh.shape[-1])
-        ctx = self.ctx_proj(torch.cat([g_veh, Z_node.mean(1), g_graph], dim=-1))
+        z_node_mean = Z_node.mean(1)
+        ctx = self.ctx_proj(torch.cat([g_veh, z_node_mean, g_graph], dim=-1))
         Q = self.Wq(ctx).unsqueeze(1)
         logits = torch.bmm(Q, self.Wk(Z_veh).transpose(1, 2)).squeeze(1) / self._scale
         logits = self.clip * torch.tanh(logits)
@@ -357,21 +359,53 @@ class VRPBTWPolicy(BasePolicy):
         super().__init__()
         self.cfg = cfg
 
-        D = cfg.embed_dim
-        H = cfg.n_heads
-        L = cfg.n_encoder_layers
-        drop = cfg.dropout
-        use_in = getattr(cfg, "use_instance_norm", True)
-        clip = cfg.clip_logits
+        # Support hierarchical config structure
+        # Looks for nested keys first (e.g., cfg["backbone"]["embedding_dim"])
+        # then falls back to flat keys (e.g., cfg["embed_dim"]) for backward compatibility
+        def _get(key: str, default=None, nested_key: Optional[str] = None):
+            if nested_key and nested_key in cfg and key in cfg[nested_key]:
+                return cfg[nested_key][key]
+            if key in cfg:
+                return cfg[key]
+            return default
 
-        self.node_encoder = NodeEncoder(D, H, L, drop, use_in)
-        self.vehicle_encoder = VehicleEncoder(D, H, max(1, L // 2), drop, use_in)
-        self.graph_encoder = GraphEncoder(D, L, drop)
+        D: int = _get("embedding_dim", nested_key="backbone") or _get("embed_dim", 128) or 128
+        H: int = _get("n_heads", nested_key="backbone") or _get("n_heads", 4) or 4
+        drop: float = _get("dropout", nested_key="regularization") or _get("dropout", 0.1) or 0.1
+        use_in: bool = _get("use_instance_norm", nested_key="regularization") or _get("use_instance_norm", True) or True
+        clip: float = _get("clip_logits", nested_key="decoder") or _get("clip_logits", 10.0) or 10.0
+
+        # Encoder layers: each encoder can have different depth
+        # Check nested keys under "backbone" first
+        backbone = cfg.get("backbone", {})
+        n_node_layers: int = (
+            backbone.get("n_node_encoder_layers")
+            or backbone.get("n_encoder_layers")
+            or cfg.get("n_node_encoder_layers")
+            or cfg.get("n_encoder_layers", 3)
+        ) or 3
+        n_veh_layers: int = (
+            backbone.get("n_vehicle_encoder_layers")
+            or backbone.get("n_encoder_layers")
+            or cfg.get("n_vehicle_encoder_layers")
+            or cfg.get("n_encoder_layers", 3)
+        ) or 3
+        n_graph_layers: int = (
+            backbone.get("n_graph_encoder_layers")
+            or backbone.get("n_encoder_layers")
+            or cfg.get("n_graph_encoder_layers")
+            or cfg.get("n_encoder_layers", 3)
+        ) or 3
+
+        self.node_encoder = NodeEncoder(D, H, n_node_layers, drop, use_in)
+        self.vehicle_encoder = VehicleEncoder(D, H, n_veh_layers, drop, use_in)
+        self.graph_encoder = GraphEncoder(D, n_graph_layers, drop)
         self.node_decoder = NodeDecoder(D, clip)
         self.vehicle_decoder = VehicleDecoder(D, clip)
         self.value_head = nn.Sequential(nn.Linear(D * 3, D), nn.Tanh(), nn.Linear(D, 1))
 
-        if getattr(cfg, "ortho_init", True):
+        ortho_init: bool = _get("ortho_init", nested_key="regularization") or _get("ortho_init", True) or True
+        if ortho_init:
             self._ortho_init(self)
 
     # ------------------------------------------------------------------
@@ -459,6 +493,12 @@ class VRPBTWPolicy(BasePolicy):
             obs, device
         )
 
+        # Convert action_mask to torch tensor if it's numpy
+        if action_mask is not None and not isinstance(action_mask, torch.Tensor):
+            action_mask = torch.from_numpy(action_mask).to(device)
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0)
+
         n_mask = (
             self._node_mask(action_mask, N1, V2K) if action_mask is not None else None
         )
@@ -473,7 +513,13 @@ class VRPBTWPolicy(BasePolicy):
         if action_mask is not None:
             flat = flat.masked_fill(~action_mask, float("-inf"))
 
-        value = self.value_head(torch.cat([g_node, g_veh, g_graph], dim=-1)).squeeze(-1)
+        # Ensure all features are 2D (B, D) before concatenation
+        g_node_2d = g_node if g_node.dim() == 2 else g_node.flatten(1)
+        g_veh_2d = g_veh if g_veh.dim() == 2 else g_veh.flatten(1)
+        g_graph_2d = g_graph if g_graph.dim() == 2 else g_graph.flatten(1)
+        value = self.value_head(
+            torch.cat([g_node_2d, g_veh_2d, g_graph_2d], dim=-1)
+        ).squeeze(-1)
         return flat, value
 
     def get_action_and_log_prob(
@@ -483,6 +529,12 @@ class VRPBTWPolicy(BasePolicy):
         Z_node, g_node, Z_veh, g_veh, Z_graph, g_graph, N1, V2K = self._encode(
             obs, device
         )
+
+        # Convert action_mask to torch tensor if it's numpy
+        if action_mask is not None and not isinstance(action_mask, torch.Tensor):
+            action_mask = torch.from_numpy(action_mask).to(device)
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0)
 
         n_mask = (
             self._node_mask(action_mask, N1, V2K) if action_mask is not None else None
@@ -506,7 +558,13 @@ class VRPBTWPolicy(BasePolicy):
         dist = torch.distributions.Categorical(logits=flat_l)
         action = flat_l.argmax(-1) if deterministic else dist.sample()
 
-        value = self.value_head(torch.cat([g_node, g_veh, g_graph], dim=-1)).squeeze(-1)
+        # Ensure all features are 2D (B, D) before concatenation
+        g_node_2d = g_node if g_node.dim() == 2 else g_node.flatten(1)
+        g_veh_2d = g_veh if g_veh.dim() == 2 else g_veh.flatten(1)
+        g_graph_2d = g_graph if g_graph.dim() == 2 else g_graph.flatten(1)
+        value = self.value_head(
+            torch.cat([g_node_2d, g_veh_2d, g_graph_2d], dim=-1)
+        ).squeeze(-1)
         return action, dist.log_prob(action), value
 
     def evaluate_actions(self, obs, actions, action_mask=None, context=None):
@@ -514,6 +572,12 @@ class VRPBTWPolicy(BasePolicy):
         Z_node, g_node, Z_veh, g_veh, Z_graph, g_graph, N1, V2K = self._encode(
             obs, device
         )
+
+        # Convert action_mask to torch tensor if it's numpy
+        if action_mask is not None and not isinstance(action_mask, torch.Tensor):
+            action_mask = torch.from_numpy(action_mask).to(device)
+            if action_mask.dim() == 1:
+                action_mask = action_mask.unsqueeze(0)
 
         n_mask = (
             self._node_mask(action_mask, N1, V2K) if action_mask is not None else None
@@ -532,5 +596,69 @@ class VRPBTWPolicy(BasePolicy):
             flat_l = flat_l.masked_fill(~action_mask, float("-inf"))
 
         dist = torch.distributions.Categorical(logits=flat_l)
-        value = self.value_head(torch.cat([g_node, g_veh, g_graph], dim=-1)).squeeze(-1)
+        # Ensure all features are 2D (B, D) before concatenation
+        g_node_2d = g_node if g_node.dim() == 2 else g_node.flatten(1)
+        g_veh_2d = g_veh if g_veh.dim() == 2 else g_veh.flatten(1)
+        g_graph_2d = g_graph if g_graph.dim() == 2 else g_graph.flatten(1)
+        value = self.value_head(
+            torch.cat([g_node_2d, g_veh_2d, g_graph_2d], dim=-1)
+        ).squeeze(-1)
         return dist.log_prob(actions), value, dist.entropy()
+
+    def compute_entropy(self, buffer, sample_size: int = 1):
+        """
+        Compute bilevel policy entropy on buffer data (sampled for efficiency).
+
+        For bilevel policies (node + vehicle decoders):
+          entropy = entropy_node + entropy_vehicle
+
+        Lower entropy = more confident policy (ready for harder tasks).
+        Higher entropy = more uncertain policy (needs more training).
+
+        Args:
+            buffer: RolloutBuffer with collected transitions
+            sample_size: number of transitions to sample (default 32 for speed)
+
+        Returns:
+            scalar entropy value (sum of node and vehicle entropies)
+        """
+        if buffer._ptr == 0:
+            return 0.0
+
+        n_sample = min(sample_size, buffer._ptr)
+        indices = np.random.choice(buffer._ptr, size=n_sample, replace=False)
+
+        entropies_node = []
+        entropies_vehicle = []
+
+        with torch.no_grad():
+            device = next(self.parameters()).device.type
+            for i in indices:
+                transition = buffer._data[i]
+                obs = transition.obs
+                mask = torch.tensor(transition.action_mask, dtype=torch.bool).unsqueeze(
+                    0
+                )
+
+                Z_node, g_node, Z_veh, g_veh, Z_graph, g_graph, N1, V2K = self._encode(
+                    obs, device
+                )
+
+                n_mask = self._node_mask(mask, N1, V2K) if mask is not None else None
+                v_mask = self._veh_mask(mask, N1, V2K) if mask is not None else None
+
+                ln = self.node_decoder(g_node, Z_veh, g_graph, Z_node, n_mask)
+                lv = self.vehicle_decoder(g_veh, Z_node, g_graph, Z_veh, v_mask)
+
+                dist_node = torch.distributions.Categorical(logits=ln)
+                dist_vehicle = torch.distributions.Categorical(logits=lv)
+
+                entropies_node.append(dist_node.entropy().mean().item())
+                entropies_vehicle.append(dist_vehicle.entropy().mean().item())
+
+        avg_entropy = (
+            (float(np.mean(entropies_node)) + float(np.mean(entropies_vehicle)))
+            if entropies_node
+            else 0.0
+        )
+        return avg_entropy

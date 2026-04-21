@@ -22,15 +22,14 @@ from __future__ import annotations
 import copy
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.optim as optim
 
 from core.buffer import RolloutBuffer
-from core.module import BasePolicy
-from core.utils import RunningNormalizer
+from core.policy import BasePolicy
 
 
 # ---------------------------------------------------------------------------
@@ -266,4 +265,3 @@ def _obs_to_tensor(obs: Any, device: str) -> Any:
             result[k] = t.long() if "edge_index" in k else t.float()
         return result
     return torch.from_numpy(obs[None]).float().to(device)
-

@@ -1,0 +1,115 @@
+experiment:
+  name: vrpbtw_maml_base
+  description: "Full MAML (second-order) meta-learning baseline on VRPBTW. CPU-feasible\
+    \ task distribution: n \u2208 {10, 20, 50, 100}. For GPU: use ablations/maml_full.yaml.\n"
+  tags:
+  - meta-learning
+  - maml
+  - vrpbtw
+  - baseline
+reproducibility:
+  seed:
+    global_seed: 42
+    env_seed: null
+    data_seed: null
+  device: cpu
+algorithm:
+  name: maml
+  description: Full MAML with second-order meta-gradients and curriculum learning
+  outer_loop:
+    optimizer: adam
+    meta_learning_rate: 0.0003
+    max_gradient_norm: 0.5
+    n_tasks_per_update: 1
+  inner_loop:
+    optimizer: sgd
+    adaptation_learning_rate: 0.01
+    n_adaptation_steps: 1
+  data_collection:
+    support_rollout_length: 256
+    query_rollout_length: 256
+  task_pool:
+    sizes:
+    - 10
+    - 20
+    - 50
+    - 100
+    distributions:
+    - RC
+  curriculum:
+    enabled: true
+    expansion_metric: entropy
+    entropy_threshold: 0.5
+    check_interval: 1
+  rl_objective:
+    gamma: 0.99
+    gae_lambda: 0.95
+    value_coefficient: 0.5
+    entropy_coefficient: 0.02
+    normalize_advantages: true
+    normalize_rewards: true
+  fine_tuning:
+    enabled: false
+    total_steps: 100000
+    steps_per_task: 10
+    learning_rate: 0.001
+environment:
+  problem:
+    name: vrpbtw
+    kwargs:
+      linehaul_ratio: 0.5
+      generator_seed_offset: 100000
+  reward:
+    scale: 1.0
+    max_episode_length: null
+network:
+  type: hgnn
+  backbone:
+    embedding_dim: 128
+    n_heads: 4
+    n_encoder_layers: 3
+    n_node_encoder_layers: 3
+    n_vehicle_encoder_layers: 3
+    n_graph_encoder_layers: 3
+  regularization:
+    dropout: 0.1
+    use_instance_norm: true
+    ortho_init: true
+  decoder:
+    clip_logits: 10.0
+    rejection_sampling_max_tries: 100
+training:
+  total_timesteps: 2000000
+  logging:
+    log_interval: 5
+    eval_interval: 20
+    checkpoint_interval: 100
+    checkpoint_dir: experiment/train
+    log_dir: experiment/train/logs
+  early_stopping:
+    patience: 150
+    min_delta: 0.0001
+    metric: mean_objective
+evaluation:
+  n_episodes: 20
+  deterministic: true
+  decoding:
+    strategy: greedy
+    beam_width: 1
+    n_samples: 1
+logging:
+  console:
+    verbose: true
+    print_keys:
+    - train/meta_loss
+    - train/update_count
+    - num_active_tasks
+  jsonl:
+    enabled: true
+    path: logs/{experiment.name}.jsonl
+  tensorboard:
+    enabled: false
+    log_dir: experiment/train/tensorboard
+  wandb:
+    enabled: false
+    project: null

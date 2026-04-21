@@ -18,21 +18,19 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
-
+from typing import Any, Callable, Dict, Optional, Tuple, List
 import numpy as np
-
-from config import EnvironmentConfig, ExperimentConfig
 
 # Problems
 from impl.environment import VRPBTWEnv
 
 # Networks
-from impl.network import VRPBTWPolicy
+from impl.policy import VRPBTWPolicy
 
 # Core
-from core.agent import BaseAgent, Agent
-from core.module import BasePolicy
+from core.agent import Agent, Agent
+from core.policy import BasePolicy
+from core.estimator import PPOEstimator
 
 _DEFAULT_DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 _GENERATED_ROOT = _DEFAULT_DATA_ROOT / "generated"
@@ -47,9 +45,13 @@ from generate import create_instance  # type: ignore[import]
 # ---------------------------------------------------------------------------
 
 
-def build_problem(env_cfg: EnvironmentConfig) -> VRPBTWEnv:
-    name = env_cfg.problem_name
-    kwargs = dict(env_cfg.problem_kwargs)
+def build_problem(cfg: Dict[str, Any]) -> VRPBTWEnv:
+    # Support hierarchical config structure
+    env_cfg = cfg.get("environment", cfg)
+    problem_cfg = env_cfg.get("problem", {})
+    name = problem_cfg.get("name", env_cfg.get("problem_name", "vrpbtw"))
+    problem_kwargs = problem_cfg.get("kwargs", env_cfg.get("problem_kwargs", {}))
+    kwargs = dict(problem_kwargs)
 
     if name == "vrpbtw":
         return VRPBTWEnv(
@@ -67,30 +69,6 @@ def build_problem(env_cfg: EnvironmentConfig) -> VRPBTWEnv:
 # ---------------------------------------------------------------------------
 
 
-def _default_raw_instance(
-    n_customers: int,
-    n_fleets: int,
-    lambda_weight: float,
-) -> Dict[str, Any]:
-    return {
-        "depot": [50.0, 50.0],
-        "customers": [],
-        "n_fleets": n_fleets,
-        "truck_capacity": 50.0,
-        "drone_capacity": 15.0,
-        "system_duration": 100.0,
-        "trip_duration": 25.0,
-        "truck_speed": 1.0,
-        "drone_speed": 2.0,
-        "truck_cost": 1.0,
-        "drone_cost": 0.5,
-        "launch_time": 2.0,
-        "land_time": 3.0,
-        "service_time": 5.0,
-        "lambda_weight": lambda_weight,
-    }
-
-
 def _normalize_generated_instance(
     data: Dict[str, Any], kwargs: Dict[str, Any]
 ) -> Dict[str, Any]:
@@ -98,37 +76,33 @@ def _normalize_generated_instance(
     vehicles = data["Config"]["Vehicles"]
     depot = data["Config"]["Depot"]
 
-    raw = _default_raw_instance(
-        n_customers=int(general["NUM_CUSTOMERS"]),
-        n_fleets=int(vehicles["NUM_TRUCKS"]),
-        lambda_weight=float(kwargs.get("lambda_weight", 0.5)),
-    )
-    raw.update(
-        {
-            "depot": list(depot["coord"]),
-            "customers": [
-                [
-                    float(node["coord"][0]),
-                    float(node["coord"][1]),
-                    float(node["tw_h"][0]),
-                    float(node["tw_h"][1]),
-                    float(node["demand"]),
-                ]
-                for node in data["Nodes"]
-            ],
-            "n_fleets": int(vehicles["NUM_TRUCKS"]),
-            "truck_capacity": float(vehicles["CAPACITY_TRUCK"]),
-            "drone_capacity": float(vehicles["CAPACITY_DRONE"]),
-            "system_duration": float(general["T_MAX_SYSTEM_H"]),
-            "trip_duration": float(vehicles["DRONE_DURATION_H"]),
-            "truck_speed": float(vehicles["V_TRUCK_KM_H"]),
-            "drone_speed": float(vehicles["V_DRONE_KM_H"]),
-            "launch_time": float(vehicles["DRONE_TAKEOFF_MIN"]) / 60.0,
-            "land_time": float(vehicles["DRONE_LANDING_MIN"]) / 60.0,
-            "service_time": float(vehicles["SERVICE_TIME_MIN"]) / 60.0,
-        }
-    )
-    return raw
+    return {
+        "depot": list(depot["coord"]),
+        "customers": [
+            [
+                float(node["coord"][0]),
+                float(node["coord"][1]),
+                float(node["tw_h"][0]),
+                float(node["tw_h"][1]),
+                float(node["demand"]),
+            ]
+            for node in data["Nodes"]
+        ],
+        "n_fleets": int(vehicles["NUM_TRUCKS"]),
+        "truck_capacity": float(vehicles["CAPACITY_TRUCK"]),
+        "drone_capacity": float(vehicles["CAPACITY_DRONE"]),
+        "system_duration": float(general["T_MAX_SYSTEM_H"]),
+        "trip_duration": float(vehicles["DRONE_DURATION_H"]),
+        "truck_speed": float(vehicles["V_TRUCK_KM_H"]),
+        "drone_speed": float(vehicles["V_DRONE_KM_H"]),
+        "truck_cost": float(kwargs.get("truck_cost", 1.0)),
+        "drone_cost": float(kwargs.get("drone_cost", 0.5)),
+        "launch_time": float(vehicles["DRONE_TAKEOFF_MIN"]) / 60.0,
+        "land_time": float(vehicles["DRONE_LANDING_MIN"]) / 60.0,
+        "service_time": float(vehicles["SERVICE_TIME_MIN"]) / 60.0,
+        "lambda_weight": float(kwargs.get("lambda_weight", 0.5)),
+        "max_coord": float(general["MAX_COORD_KM"]),
+    }
 
 
 def _load_generated_config() -> Dict[str, Any]:
@@ -136,11 +110,17 @@ def _load_generated_config() -> Dict[str, Any]:
         return json.load(fh)
 
 
-def get_generator(env_cfg: EnvironmentConfig) -> Callable[..., Any]:
-    name = env_cfg.problem_name
+def get_generator(cfg: Dict[str, Any]) -> Callable[..., Any]:
+    # Support hierarchical config structure
+    env_cfg = cfg.get(
+        "environment", cfg
+    )  # Fallback to cfg if environment key not found
+    problem_cfg = env_cfg.get("problem", {})
+    name = problem_cfg.get("name", env_cfg.get("problem_name", "vrpbtw"))
 
     if name == "vrpbtw":
-        kwargs = dict(env_cfg.problem_kwargs)
+        problem_kwargs = problem_cfg.get("kwargs", {})
+        kwargs = dict(problem_kwargs)
         generated_cfg = _load_generated_config()
 
         def _generator(
@@ -164,9 +144,7 @@ def get_generator(env_cfg: EnvironmentConfig) -> Callable[..., Any]:
                 if rng is not None
                 else int(extra_kwargs.get("seed", kwargs.get("seed", 42))) + seed_offset
             )
-            data = create_instance(
-                generated_cfg, n_customers, dist, ratio, seed
-            )
+            data = create_instance(generated_cfg, n_customers, dist, ratio, seed)
             raw = _normalize_generated_instance(data, kwargs)
 
             # Allow RL-specific overrides while keeping the data/generated pattern.
@@ -201,7 +179,7 @@ def get_generator(env_cfg: EnvironmentConfig) -> Callable[..., Any]:
 # ---------------------------------------------------------------------------
 
 
-def build_task_pool(cfg: ExperimentConfig) -> Dict[str, Tuple[Any, Callable]]:
+def build_task_pool(cfg: Dict[str, Any]) -> Dict[str, Tuple[Any, Callable]]:
     """
     Build a MAML task pool with multiple coordinate distributions.
 
@@ -215,14 +193,22 @@ def build_task_pool(cfg: ExperimentConfig) -> Dict[str, Tuple[Any, Callable]]:
     the task pool into Task objects and a TaskManager for curriculum-based
     meta-learning.
     """
-    task_sizes = cfg.maml.task_sizes
-    task_distributions = cfg.maml.task_distributions
+    # Support hierarchical config structure
+    algo_cfg = cfg.get("algorithm", {})
+    task_pool_cfg = algo_cfg.get("task_pool", {})
+    task_sizes = task_pool_cfg.get(
+        "sizes", cfg.get("maml", {}).get("task_sizes", [10, 20, 50, 100])
+    )
+    task_distributions = task_pool_cfg.get(
+        "distributions", cfg.get("maml", {}).get("task_distributions", ["RC"])
+    )
+
     data_cfg = _load_generated_config()
     fleet_map: Dict[int, int] = {
         int(k): int(v) for k, v in data_cfg["FLEET_SIZES"].items()
     }
 
-    base_gen = get_generator(cfg.env)
+    base_gen = get_generator(cfg)
     pool: Dict[str, Tuple[Any, Callable]] = {}
 
     for size in task_sizes:
@@ -236,9 +222,10 @@ def build_task_pool(cfg: ExperimentConfig) -> Dict[str, Tuple[Any, Callable]]:
 
             # Each task has a dedicated RNG: hash of (size, dist) ensures determinism
             # while keeping distinct streams for different tasks
-            _rng = np.random.default_rng(
-                cfg.seed.global_seed + hash((size, dist)) % (2**31 - 1)
-            )
+            reproducibility_cfg = cfg.get("reproducibility", {})
+            seed_cfg = reproducibility_cfg.get("seed", cfg.get("seed", {}))
+            global_seed = seed_cfg.get("global_seed", 42)
+            _rng = np.random.default_rng(global_seed + hash((size, dist)) % (2**31 - 1))
 
             # Closure captures size, distribution, fleet count, and RNG
             gen = _make_task_generator(size, dist, n_fleets, base_gen, _rng)
@@ -294,12 +281,13 @@ def sort_task_ids(task_ids: List[str]) -> List[str]:
 
 
 def build_network(
-    cfg: ExperimentConfig,
+    cfg: Dict[str, Any],
 ) -> BasePolicy:
-    net_type = cfg.network.network_type
+    net_cfg = cfg["network"]
+    net_type = net_cfg.get("type") or net_cfg.get("network_type", "hgnn")
 
     if net_type == "hgnn":
-        return VRPBTWPolicy(cfg=cfg.network)
+        return VRPBTWPolicy(cfg=net_cfg)
 
     raise ValueError(
         f"Unknown network type {net_type!r}.  "
@@ -312,7 +300,30 @@ def build_network(
 # ---------------------------------------------------------------------------
 
 
-def build_agent(cfg: ExperimentConfig) -> BaseAgent:
+def build_agent(cfg: Dict[str, Any]) -> Agent:
     network = build_network(cfg)
-    network = network.to_device(cfg.device)
-    return Agent(policy=network, device=cfg.device)
+    device = cfg.get("device", "cpu")
+    network = network.to_device(device)
+
+    # Build estimator (PPO for all algorithms)
+    algo_cfg = cfg.get("algorithm", {})
+    if isinstance(algo_cfg, dict):
+        algo_name = algo_cfg.get("name", "").lower()
+    else:
+        algo_name = str(algo_cfg).lower()
+
+    # Extract RL objective config (works for both MAML and single-env)
+    rl_obj_cfg = algo_cfg.get("rl_objective", {}) if isinstance(algo_cfg, dict) else {}
+    if not rl_obj_cfg:
+        rl_obj_cfg = cfg.get("rl_objective", {})
+
+    estimator = PPOEstimator(
+        device=device,
+        gamma=rl_obj_cfg.get("gamma", 0.99),
+        gae_lambda=rl_obj_cfg.get("gae_lambda", 0.95),
+        value_coef=rl_obj_cfg.get("value_coefficient", 0.5),
+        entropy_coef=rl_obj_cfg.get("entropy_coefficient", 0.02),
+        clip_ratio=rl_obj_cfg.get("clip_eps", 0.2),
+    )
+
+    return Agent(policy=network, estimator=estimator, device=device)

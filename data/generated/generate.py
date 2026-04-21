@@ -77,8 +77,8 @@ def create_instance(config, n, dist_type, ratio, seed):
         )
     depot_coord = [max_coord / 2, max_coord / 2]
 
-    # Standard 12-hour operational window for research benchmarks
-    t_max_system = 12.0
+    # Read time horizon from config, default to 12.0 for backward compatibility
+    t_max_system = float(config.get("T_MAX_SYSTEM_H", 24.0))
 
     num_trucks = config["FLEET_SIZES"].get(str(n), max(1, n // 8))
 

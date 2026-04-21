@@ -3,35 +3,32 @@
 #   from core import BaseAgent, PPOAgent, RolloutBuffer, Environment, ...
 # instead of drilling into sub-modules.
 
-from core.agent import BaseAgent, Agent
+from core.agent import Agent, BaseAgent
 from core.buffer import Transition, RolloutBuffer
 from core.estimator import BaseEstimator, PPOEstimator
 from core.evaluator import Evaluator
 from core.logger import Logger
-from core.module import BasePolicy
+from core.policy import BasePolicy
 from core.environment import Environment, ActionMask, StepResult, Solution, SolutionPool
 from core.task import Task, SimpleTask, TaskManager
 from core.trainer import (
-    BaseTrainer,
+    Trainer,
     MetaTrainer,
+    POMOTrainer,
     CurriculumScheduler,
     FineTuner,
-    InnerUpdater,
-    MetaLearner,
-    compute_policy_entropy,
 )
 from core.utils import SeedManager, RunningNormalizer
 
 __all__ = [
     # agents
-    "BaseAgent",
     "Agent",
+    "BaseAgent",
     # buffers
     "Transition",
     "RolloutBuffer",
     # curriculum
     "CurriculumScheduler",
-    "compute_policy_entropy",
     # estimators
     "BaseEstimator",
     "PPOEstimator",
@@ -39,12 +36,8 @@ __all__ = [
     "Evaluator",
     # fine tuner
     "FineTuner",
-    # inner updater
-    "InnerUpdater",
     # logger
     "Logger",
-    # meta learner
-    "MetaLearner",
     # networks
     "BasePolicy",
     # problem
@@ -58,8 +51,9 @@ __all__ = [
     "SimpleTask",
     "TaskManager",
     # trainer
-    "BaseTrainer",
+    "Trainer",
     "MetaTrainer",
+    "POMOTrainer",
     # utils
     "SeedManager",
     "RunningNormalizer",

@@ -1,38 +1,15 @@
 """
-train.py
---------
-Training entry point.
+train_debug.py - Debug version of train.py with verbose output to trace hangs.
 
-All hyperparameters live in configs/train.yaml (edit this file for ablations).
-Outputs are saved to: experiment/train/{experiment.name}/
-
-CLI flags  (runtime only — not hyperparameters)
------------------------------------------------
-  --config   PATH    Config file               [default: configs/train.yaml]
-  --override PATH    Config override file      [optional]
-  --device   DEVICE  Override reproducibility.device
-  --name     NAME    Override experiment.name
-  --beam     WIDTH   Override evaluation.decoding.beam_width
-
-Usage
------
-  # Standard run (reads configs/train.yaml, outputs to experiment/train/{name}/)
-  python train.py
-
-  # Custom config file
-  python train.py --config configs/custom_train.yaml
-
-  # Config override
-  python train.py --override custom_override.yaml
-
-  # GPU override without editing the file
-  python train.py --device cuda --name my_experiment
+Run this instead of train.py to identify where the process is hanging.
+Each major phase prints a timestamp and checkpoint.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 from typing import Any, Optional, Dict
 
@@ -58,9 +35,9 @@ from registry import (
 )
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
+def log_checkpoint(msg: str) -> None:
+    """Print timestamped debug message."""
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -102,21 +79,19 @@ def _build_parser() -> argparse.ArgumentParser:
     return p
 
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
 def main() -> None:
+    log_checkpoint("=== TRAINING START ===")
     args = _build_parser().parse_args()
 
     # ── 1. Config ───────────────────────────────────────────────────────
+    log_checkpoint(f"Loading config from {args.config}")
     cfg = (
         merge_configs(args.config, args.override)
         if args.override
         else load_config(args.config)
     )
-    # Apply CLI overrides to hierarchical config
+    log_checkpoint(f"Config loaded. Keys: {list(cfg.keys())}")
+
     if args.device:
         cfg["device"] = args.device
     if args.name:
@@ -131,26 +106,11 @@ def main() -> None:
             cfg["evaluation"]["decoding"] = {}
         cfg["evaluation"]["decoding"]["beam_width"] = args.beam
 
-    print(
-        f"\n  Config     : {args.config}"
-        + (f"  +  {args.override}" if args.override else "")
-    )
     exp_name = cfg.get("name") or cfg.get("experiment", {}).get("name", "experiment")
-    algo_name = cfg.get("algorithm", "")
-    if isinstance(algo_name, dict):
-        algo_name = algo_name.get("name", "").upper()
-    else:
-        algo_name = algo_name.upper()
-    net_type = cfg.get("network", {}).get("type", "hgnn")
-    device = cfg.get("device", "cpu")
-    print(f"  Experiment : {exp_name}")
-    print(
-        f"  Algorithm  : {algo_name}  |  "
-        f"Network: {net_type}  |  "
-        f"Device: {device}"
-    )
+    log_checkpoint(f"Experiment: {exp_name}")
 
     # ── 2. Reproducibility ──────────────────────────────────────────────
+    log_checkpoint("Setting up reproducibility...")
     reproducibility_cfg = cfg.get("reproducibility", {})
     seed_cfg = reproducibility_cfg.get("seed", cfg.get("seed", {}))
     seed_mgr = SeedManager(
@@ -160,19 +120,18 @@ def main() -> None:
     )
     seed_mgr.seed_everything()
     data_rng = seed_mgr.make_data_rng()
-    print(f"  {seed_mgr}")
+    log_checkpoint(f"Reproducibility set: {seed_mgr}")
 
     # ── 3. Logger ───────────────────────────────────────────────────────
+    log_checkpoint("Setting up logger...")
     training_cfg = cfg.get("training", cfg.get("train", {}))
     train_logging = training_cfg.get("logging", {})
 
-    # Create experiment-specific output directories
     base_checkpoint_dir = train_logging.get("checkpoint_dir", "experiment/train")
     checkpoint_dir = Path(base_checkpoint_dir) / exp_name
     log_dir = checkpoint_dir / "logs"
     tensorboard_dir = checkpoint_dir / "tensorboard"
 
-    # Ensure directories exist
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -181,35 +140,47 @@ def main() -> None:
         experiment_name=exp_name,
         verbose=True,
     )
+    log_checkpoint(f"Logger initialized. Log dir: {log_dir}")
 
     # ── 3b. Save config snapshot ────────────────────────────────────────
     config_path = checkpoint_dir / f"{exp_name}_config.yaml"
     save_config(cfg, str(config_path))
-    print(f"  Config saved: {config_path}")
+    log_checkpoint(f"Config saved to {config_path}")
 
-    # ── 4. Build agent + trainer (dispatched by cfg.algorithm) ──────────
+    # ── 4. Build components ─────────────────────────────────────────────
+    algo_name = cfg.get("algorithm", "")
+    if isinstance(algo_name, dict):
+        algo_name = algo_name.get("name", "").upper()
+    else:
+        algo_name = algo_name.upper()
+
     algo_name_lower = algo_name.lower()
-    if algo_name_lower == "maml":
-        task_pool = build_task_pool(cfg)
 
-        # Build TaskManager from task pool
+    if algo_name_lower == "maml":
+        log_checkpoint("Building task pool...")
+        task_pool = build_task_pool(cfg)
+        log_checkpoint(f"Task pool built: {list(task_pool.keys())}")
+
+        log_checkpoint("Creating TaskManager...")
         tasks = []
-        for task_id in sort_task_ids(list(task_pool.keys())):
+        for task_id in sorted(task_pool.keys()):
             problem, gen = task_pool[task_id]
             task = SimpleTask(task_id=task_id, problem=problem, generator=gen)
             tasks.append(task)
         task_manager = TaskManager(tasks)
+        log_checkpoint(f"TaskManager created with {len(tasks)} tasks")
 
-        # Use median task size as the fixed evaluation anchor during training.
-        # Full cross-size evaluation is done post-training with evaluate.py.
+        log_checkpoint("Selecting evaluation anchor task...")
         eval_task_ids = sort_task_ids(list(task_pool.keys()))
         eval_task_id = eval_task_ids[len(eval_task_ids) // 2]
         eval_problem, eval_gen = task_pool[eval_task_id]
-        print(f"  Tasks      : {eval_task_ids}  |  Eval anchor: {eval_task_id}")
+        log_checkpoint(f"Eval anchor: {eval_task_id}")
 
+        log_checkpoint("Building agent...")
         agent = build_agent(cfg=cfg)
-        print(f"  Agent      : {agent}\n")
+        log_checkpoint(f"Agent built: {type(agent).__name__}")
 
+        log_checkpoint("Building evaluator...")
         eval_cfg = training_cfg.get("evaluation", cfg.get("evaluation", {}))
         eval_decoding = eval_cfg.get("decoding", {})
         n_episodes = eval_cfg.get("n_episodes", 20)
@@ -223,7 +194,9 @@ def main() -> None:
             deterministic=deterministic,
             beam_width=beam_width,
         )
+        log_checkpoint("Evaluator built")
 
+        log_checkpoint("Building MetaTrainer...")
         trainer = MetaTrainer(
             agent=agent,
             task_manager=task_manager,
@@ -233,80 +206,25 @@ def main() -> None:
             evaluator=evaluator,
             logger=logger,
         )
+        log_checkpoint("MetaTrainer built")
 
         # Phase 1: Meta-learning
+        log_checkpoint("=" * 64)
+        log_checkpoint("STARTING PHASE 1: META-LEARNING")
+        log_checkpoint("=" * 64)
         phase1_summary = trainer.train()
+        log_checkpoint("Phase 1 complete")
 
         best_ckpt_path = checkpoint_dir / f"{exp_name}_best.pt"
         try:
             agent.load(str(best_ckpt_path))
-            print(f"\nLoaded best checkpoint: {best_ckpt_path}")
+            log_checkpoint(f"Loaded best checkpoint: {best_ckpt_path}")
         except Exception as exc:
-            print(f"Could not load best checkpoint ({exc}); using final weights.")
+            log_checkpoint(f"Could not load best checkpoint ({exc}); using final weights.")
 
-        algo_cfg = cfg.get("algorithm", {})
-        if isinstance(algo_cfg, str):
-            algo_cfg = cfg.get("maml", algo_cfg)  # Fallback to maml key for backward compatibility
-        task_pool_cfg = algo_cfg.get("task_pool", {})
-        task_sizes = task_pool_cfg.get("sizes", [10, 20, 50, 100])
-        eval_size = task_sizes[len(task_sizes) // 2]
-        phase1_eval = evaluator.evaluate(eval_gen)
-        _print_eval(phase1_eval, label=f"Phase 1 evaluation (n={eval_size})")
-
-        # Phase 2: Fine-tuning (optional)
-        fine_tuning_cfg = algo_cfg.get("fine_tuning", {})
-        ft_enabled = fine_tuning_cfg.get("enabled", False)
-        if ft_enabled:
-            print("\n" + "=" * 64)
-            print("  Phase 2: Task-Specific Fine-Tuning")
-            print("=" * 64)
-
-            fine_tuner = FineTuner(
-                agent=agent,
-                task_manager=trainer.task_manager,
-                cfg=cfg,
-            )
-            fine_tuner.initialize()
-
-            print(f"  Initialized {len(fine_tuner.get_all_agents())} task-specific agents\n")
-
-            # Phase 2: fine-tune each task
-            timestep = 0
-            ft_steps_per_task = fine_tuning_cfg.get("steps_per_task", 10)
-            ft_lr = fine_tuning_cfg.get("learning_rate", 0.001)
-            ft_total_steps = fine_tuning_cfg.get("total_steps", 100000)
-
-            for task_id in fine_tuner.get_all_agents().keys():
-                if timestep >= ft_total_steps:
-                    break
-
-                task = trainer.task_manager.get_task(task_id)
-                task_opt = optim.Adam(agent.policy.parameters(), lr=ft_lr)
-
-                print(f"  Fine-tuning task {task_id}...")
-                steps = fine_tuner.finetune_task(
-                    task_id=task_id,
-                    task_problem=task.problem,
-                    task_gen=task.generator,
-                    optimizer=task_opt,
-                    num_steps=ft_steps_per_task,
-                )
-                timestep += steps
-
-            phase2_eval = evaluator.evaluate(eval_gen)
-            fine_tuner.save_task_policies(str(checkpoint_dir))
-            _print_eval(phase2_eval, label=f"Phase 2 evaluation (n={eval_size})")
-
-
-# ---------------------------------------------------------------------------
-# Shared display helper (also used by evaluate.py)
-# ---------------------------------------------------------------------------
-
-
-def _print_eval(stats: dict, label: str = "Evaluation") -> None:
-    print(f"\n{label}:")
-    for k, v in stats.items():
-        print(f"  {k:<28}: {v:.4f}" if isinstance(v, float) else f"  {k:<28}: {v}")
+        log_checkpoint("=" * 64)
+        log_checkpoint("TRAINING COMPLETE")
+        log_checkpoint("=" * 64)
 
 
 if __name__ == "__main__":

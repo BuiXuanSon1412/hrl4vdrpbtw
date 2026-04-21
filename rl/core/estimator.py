@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from core.buffer import RolloutBuffer
 from core.agent import _obs_to_tensor
-from core.module import BasePolicy
+from core.policy import BasePolicy
 
 
 class BaseEstimator(ABC):
@@ -48,6 +48,22 @@ class BaseEstimator(ABC):
             scalar loss tensor for backpropagation.
         """
         ...
+
+    def compute_entropy(self, agent: Any, buffer: RolloutBuffer) -> float:
+        """
+        Compute policy entropy for curriculum monitoring (optional).
+
+        Default: returns 0.0 (no entropy computation).
+        Override in subclasses for problem-specific entropy metrics.
+
+        Args:
+            agent: BaseAgent with policy and related components.
+            buffer: rollout buffer with collected transitions.
+
+        Returns:
+            scalar entropy value.
+        """
+        return 0.0
 
 
 class PPOEstimator(BaseEstimator):
@@ -89,8 +105,9 @@ class PPOEstimator(BaseEstimator):
 
         # Compute GAE advantages and returns on-the-fly
         advantages = self._compute_advantages(buffer)
+        returns = self._compute_returns(buffer, advantages)
 
-        total_loss = 0.0
+        total_loss = None
         for i, tr in enumerate(buffer._data[:n]):
             obs_t = _obs_to_tensor(tr.obs, self.device)
             act_t = torch.tensor([tr.action], dtype=torch.long, device=self.device)
@@ -99,7 +116,7 @@ class PPOEstimator(BaseEstimator):
             ).unsqueeze(0)
             adv = torch.tensor([advantages[i]], dtype=torch.float32, device=self.device)
             ret = torch.tensor(
-                [tr.value + advantages[i]], dtype=torch.float32, device=self.device
+                [returns[i]], dtype=torch.float32, device=self.device
             )
             old_log_prob = torch.tensor(
                 [tr.log_prob], dtype=torch.float32, device=self.device
@@ -125,12 +142,18 @@ class PPOEstimator(BaseEstimator):
                 + self.value_coef * value_loss
                 + self.entropy_coef * entropy_loss
             ) / n
-            total_loss = total_loss + loss_i
+            total_loss = loss_i if total_loss is None else total_loss + loss_i
 
-        return torch.tensor(total_loss)
+        return total_loss if total_loss is not None else torch.tensor(0.0, device=self.device, requires_grad=True)
 
     def _compute_advantages(self, buffer: RolloutBuffer) -> list:
-        """Compute GAE-λ advantages for all transitions in the buffer."""
+        """
+        Compute GAE-λ advantages for all transitions in the buffer.
+
+        Bootstraps from next state value, properly handling episode boundaries
+        (done=1 prevents GAE flow across episodes). At buffer end, bootstraps
+        from the last state's value estimate if episode continues (not_done=1).
+        """
         n = buffer._ptr
         gae = 0.0
         advantages = [0.0] * n
@@ -138,7 +161,12 @@ class PPOEstimator(BaseEstimator):
         for t in reversed(range(n)):
             tr = buffer._data[t]
             not_done = 1.0 - float(tr.done)
-            next_val = buffer._data[t + 1].value * not_done if t < n - 1 else 0.0
+
+            if t < n - 1:
+                next_val = buffer._data[t + 1].value * not_done
+            else:
+                next_val = buffer._data[t].value * not_done
+
             delta = tr.reward + self.gamma * next_val - tr.value
             gae = delta + self.gamma * self.gae_lambda * not_done * gae
             advantages[t] = gae
@@ -149,3 +177,11 @@ class PPOEstimator(BaseEstimator):
         advantages = [(a - mean) / std for a in advantages]
 
         return advantages
+
+    def _compute_returns(self, buffer: RolloutBuffer, advantages: list) -> list:
+        """Compute value targets as return = V_old(s_t) + advantage."""
+        returns = [
+            buffer._data[i].value + advantages[i]
+            for i in range(buffer._ptr)
+        ]
+        return returns

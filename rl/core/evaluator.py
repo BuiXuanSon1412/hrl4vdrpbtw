@@ -26,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from core.agent import BaseAgent
+from core.agent import Agent
 from core.environment import Environment, Solution, SolutionPool
 
 
@@ -46,7 +46,7 @@ class Evaluator:
 
     def __init__(
         self,
-        agent: BaseAgent,
+        agent: Agent,
         env: Environment,
         n_episodes: int = 20,
         deterministic: bool = True,
@@ -72,6 +72,7 @@ class Evaluator:
         objectives: List[float] = []
         rewards: List[float] = []
         times: List[float] = []
+        solutions: List[Any] = []
 
         gen = (lambda: instance_generator(size=size)) if size else instance_generator
 
@@ -89,21 +90,22 @@ class Evaluator:
             times.append(time.time() - t0)
             objectives.append(sol.objective)
             rewards.append(sol.metadata.get("episode_reward", sol.objective))
+            solutions.append(sol)
 
         stats: Dict[str, float] = {
             "mean_objective": float(np.mean(objectives)),
             "std_objective": float(np.std(objectives)),
             "best_objective": float(np.max(objectives)),
             "worst_objective": float(np.min(objectives)),
+            "median_objective": float(np.median(objectives)),
             "mean_reward": float(np.mean(rewards)),
             "mean_time_s": float(np.mean(times)),
             "n_episodes": float(self.n_episodes),
         }
 
-        heuristic = self.env.heuristic_solution()
-        if heuristic is not None and heuristic != 0:
-            gap = (heuristic - stats["mean_objective"]) / abs(heuristic) * 100
-            stats["optimality_gap_pct"] = gap
+        # Solution quality breakdown
+        sol_stats = self.evaluate_solutions(solutions)
+        stats.update({f"solution_{k}": v for k, v in sol_stats.items()})
 
         return stats
 
@@ -195,7 +197,7 @@ class Evaluator:
 
         best = max(
             completed,
-            key=lambda x: env.scalar_objective(x[1]),
+            key=lambda x: env.decode_solution(x[1]).objective,
         )
         sol = env.decode_solution(best[1])
         sol.decision_sequence = best[2]
@@ -234,11 +236,49 @@ class Evaluator:
     # ------------------------------------------------------------------
 
     def evaluate_solutions(self, solutions: List[Solution]) -> Dict[str, float]:
+        """Analyze solution quality, diversity, and constraint satisfaction."""
+        if not solutions:
+            return {}
+
         objs = [s.objective for s in solutions]
-        return {
+        stats = {
             "mean_objective": float(np.mean(objs)),
             "std_objective": float(np.std(objs)),
             "best_objective": float(np.max(objs)),
             "worst_objective": float(np.min(objs)),
+            "median_objective": float(np.median(objs)),
             "n_solutions": float(len(solutions)),
         }
+
+        # Solution structure diagnostics (if metadata available)
+        drone_counts = []
+        route_lengths = []
+        constraint_violations = 0
+
+        for sol in solutions:
+            meta = sol.metadata if hasattr(sol, "metadata") else {}
+
+            # Drone usage
+            if "drone_count" in meta:
+                drone_counts.append(float(meta["drone_count"]))
+            if "n_drone_routes" in meta:
+                route_lengths.append(float(meta["n_drone_routes"]))
+
+            # Constraint violations
+            if "constraint_violations" in meta:
+                constraint_violations += meta["constraint_violations"]
+
+        if drone_counts:
+            stats["mean_drone_count"] = float(np.mean(drone_counts))
+            stats["std_drone_count"] = float(np.std(drone_counts))
+
+        if route_lengths:
+            stats["mean_n_drone_routes"] = float(np.mean(route_lengths))
+
+        if constraint_violations > 0:
+            stats["total_constraint_violations"] = float(constraint_violations)
+            stats["avg_violations_per_solution"] = float(
+                constraint_violations / len(solutions)
+            )
+
+        return stats
