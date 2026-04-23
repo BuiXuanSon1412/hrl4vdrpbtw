@@ -852,14 +852,7 @@ class POMOTrainer(BaseTrainer):
 
         # Extract config from hierarchical structure
         trainer_cfg = cfg.get("trainer", {})
-        agent_cfg = trainer_cfg.get("agent", {})
-        hparams_cfg = trainer_cfg.get("hparams", {})
         training_cfg = trainer_cfg.get("training", cfg.get("training", cfg.get("train", {})))
-
-        self.pcfg = {
-            "learning_rate": float(agent_cfg.get("learning_rate", 0.001)),
-            "max_grad_norm": float(hparams_cfg.get("max_grad_norm", 0.5)),
-        }
 
         train_logging = training_cfg.get("logging", {})
         early_stop = training_cfg.get("early_stopping", {})
@@ -893,18 +886,9 @@ class POMOTrainer(BaseTrainer):
             ),
         }
 
-        if agent._opt_policy is None:
-            self._optimizer: optim.Optimizer = optim.Adam(
-                agent.policy.parameters(), lr=self.pcfg["learning_rate"]
-            )
-            agent._opt_policy = self._optimizer
-        else:
-            opt = agent.opt_policy
-            if opt is None:
-                raise ValueError(
-                    "POMOTrainer requires an optimizer. Agent must have opt_policy or allow creation."
-                )
-            self._optimizer = opt
+        # Verify agent has optimizer for updates
+        if agent.opt_policy is None:
+            raise ValueError("POMOTrainer requires agent.opt_policy")
 
         self._timestep = 0
         self._iteration = 0
@@ -1076,13 +1060,12 @@ class POMOTrainer(BaseTrainer):
 
     def _update_policy(self, generator: Callable) -> Dict[str, float]:
         """
-        Perform one POMO update using REINFORCEEstimator.
+        Perform one POMO update using agent.update().
 
         Steps:
           1. Collect rollouts from multiple candidate starting points
-          2. Compute loss via estimator.compute_loss()
-          3. Backprop and step optimizer
-          4. Return metrics
+          2. Update policy via agent.update()
+          3. Return metrics
         """
         buffer, episode_returns = self._collect(generator)
 
@@ -1093,19 +1076,11 @@ class POMOTrainer(BaseTrainer):
                 "_steps": 0,
             }
 
-        loss = self.agent.estimator.compute_loss(self.agent.policy, buffer)
-
-        self._optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(
-            self.agent.policy.parameters(), self.pcfg["max_grad_norm"]
-        )
-        self._optimizer.step()
-
+        loss = self.agent.update(buffer)
         avg_return = float(np.mean(episode_returns)) if episode_returns else 0.0
 
         return {
-            "train/pomo_loss": float(loss.item()),
+            "train/pomo_loss": loss,
             "train/avg_episode_return": avg_return,
             "_steps": buffer._ptr,
         }
