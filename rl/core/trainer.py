@@ -845,11 +845,10 @@ class POMOTrainer(BaseTrainer):
             self.experiment_name = cfg.get("name") or experiment.get("name", "pomo_experiment")
         self.device = cfg.get("device", "cpu")
 
-        # Extract generator from first task in pool
+        # Setup task iteration
         if not tasks:
             raise ValueError("POMOTrainer requires at least one task")
-        first_task_id = list(tasks.keys())[0]
-        _, self.generator = tasks[first_task_id]
+        self.task_ids = list(tasks.keys())
 
         # Extract config from hierarchical structure
         trainer_cfg = cfg.get("trainer", {})
@@ -932,51 +931,63 @@ class POMOTrainer(BaseTrainer):
         )
 
     def train(self) -> Dict[str, Any]:
-        """Run POMO training loop and return summary."""
-        self._print_header()
+        """Run POMO training loop, training one model per task."""
         start_time = time.time()
-        stop_reason = "timestep_limit"
 
-        while self._timestep < self.tcfg["total_timesteps"]:
-            iter_start = time.time()
-            self._iteration += 1
+        for task_id in self.task_ids:
+            _, generator = self.tasks[task_id]
+            self._print_header_task(task_id)
+            task_start_time = time.time()
+            stop_reason = "timestep_limit"
+            task_timestep = 0
+            task_iteration = 0
+            task_best_objective = float("-inf")
+            task_patience_counter = 0
 
-            metrics = self._update_policy()
-            self._timestep += int(metrics.pop("_steps", 0))
+            while task_timestep < self.tcfg["total_timesteps"]:
+                iter_start = time.time()
+                task_iteration += 1
 
-            metrics["iter_time_s"] = time.time() - iter_start
+                metrics = self._update_policy(generator)
+                task_timestep += int(metrics.pop("_steps", 0))
 
-            if self._iteration % self.tcfg["log_interval"] == 0:
-                self.logger.log_metrics(
-                    metrics,
-                    step=self._timestep,
-                    print_keys=["train/pomo_loss", "train/avg_episode_return"],
-                )
+                metrics["iter_time_s"] = time.time() - iter_start
 
-            if self._iteration % self.tcfg["eval_interval"] == 0:
-                eval_stats = self.evaluator.evaluate(self.generator)
-                self.logger.log_metrics(eval_stats, step=self._timestep, prefix="eval")
-
-                mean_obj = eval_stats.get("mean_objective", float("-inf"))
-                if mean_obj > self._best_objective + self.tcfg["min_delta"]:
-                    self._best_objective = mean_obj
-                    self._patience_counter = 0
-                    self._save_checkpoint("best")
-                    self.logger.log_event(
-                        "best_checkpoint", self._timestep, objective=f"{mean_obj:.4f}"
+                if task_iteration % self.tcfg["log_interval"] == 0:
+                    self.logger.log_metrics(
+                        metrics,
+                        step=task_timestep,
+                        print_keys=["train/pomo_loss", "train/avg_episode_return"],
                     )
-                else:
-                    self._patience_counter += 1
 
-                if self._patience_counter >= self.tcfg["patience"]:
-                    stop_reason = "early_stopping"
-                    self.logger.log_event(
-                        "early_stop", self._timestep, patience=self.tcfg["patience"]
-                    )
-                    break
+                if task_iteration % self.tcfg["eval_interval"] == 0:
+                    eval_stats = self.evaluator.evaluate(generator)
+                    self.logger.log_metrics(eval_stats, step=task_timestep, prefix="eval")
+
+                    mean_obj = eval_stats.get("mean_objective", float("-inf"))
+                    if mean_obj > task_best_objective + self.tcfg["min_delta"]:
+                        task_best_objective = mean_obj
+                        task_patience_counter = 0
+                        self._save_checkpoint(f"best_{task_id}")
+                        self.logger.log_event(
+                            "best_checkpoint", task_timestep, objective=f"{mean_obj:.4f}"
+                        )
+                    else:
+                        task_patience_counter += 1
+
+                    if task_patience_counter >= self.tcfg["patience"]:
+                        stop_reason = "early_stopping"
+                        self.logger.log_event(
+                            "early_stop", task_timestep, patience=self.tcfg["patience"]
+                        )
+                        break
+
+            self._timestep += task_timestep
+            self._iteration += task_iteration
+            self._best_objective = max(self._best_objective, task_best_objective)
 
         summary = {
-            "stop_reason": stop_reason,
+            "stop_reason": "completed",
             "total_iterations": self._iteration,
             "total_timesteps": self._timestep,
             "best_objective": self._best_objective,
@@ -988,7 +999,7 @@ class POMOTrainer(BaseTrainer):
         self._print_footer(summary)
         return summary
 
-    def _update_policy(self) -> Dict[str, float]:
+    def _update_policy(self, generator: Callable) -> Dict[str, float]:
         """
         Perform one POMO update using REINFORCEEstimator.
 
@@ -1007,7 +1018,7 @@ class POMOTrainer(BaseTrainer):
 
         for _ in range(n_instances):
             for attempt in range(100):
-                raw = self.generator()
+                raw = generator()
                 obs, info = self.env.reset(raw)
                 if info["action_mask"].any():
                     break
@@ -1111,9 +1122,17 @@ class POMOTrainer(BaseTrainer):
             f"\n{'=' * 64}\n"
             f"  Experiment : {self.experiment_name}\n"
             f"  Algorithm  : POMO (Multiple Optima)\n"
-            f"  Budget     : {self.tcfg['total_timesteps']:,} steps\n"
+            f"  Tasks      : {len(self.task_ids)}\n"
+            f"  Budget/task: {self.tcfg['total_timesteps']:,} steps\n"
             f"  Device     : {self.device}\n"
             f"{'=' * 64}"
+        )
+
+    def _print_header_task(self, task_id: str) -> None:
+        print(
+            f"\n{'-' * 64}\n"
+            f"  Task: {task_id}\n"
+            f"{'-' * 64}"
         )
 
     def _print_footer(self, summary: Dict) -> None:
