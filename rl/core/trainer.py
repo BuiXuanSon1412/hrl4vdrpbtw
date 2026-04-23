@@ -999,90 +999,94 @@ class POMOTrainer(BaseTrainer):
         self._print_footer(summary)
         return summary
 
+    def _collect(self, generator: Callable) -> Tuple[RolloutBuffer, List[float]]:
+        """Collect rollouts using POMO multi-start strategy.
+
+        For each problem instance, collect complete episodes from multiple
+        candidate starting points.
+
+        Args:
+            generator: callable that generates raw problem instances
+
+        Returns:
+            (buffer, episode_returns): collected transitions and episode metrics
+        """
+        buffer = RolloutBuffer(capacity=self.tcfg.get("rollout_len", 2048))
+        episode_returns = []
+
+        for attempt in range(100):
+            raw = generator()
+            obs, info = self.env.reset(raw)
+            if info["action_mask"].any():
+                break
+        else:
+            return buffer, episode_returns
+
+        try:
+            candidates = self.env.get_candidate_starts()
+        except NotImplementedError:
+            candidates = [(self.env._current_state, obs, info)]
+
+        if not candidates:
+            return buffer, episode_returns
+
+        for state, start_obs, start_info in candidates:
+            if buffer.is_full:
+                break
+
+            self.env._current_state = state
+            traj_obs = start_obs
+            traj_mask = start_info["action_mask"]
+            episode_return = 0.0
+
+            while not buffer.is_full:
+                action, lp, val = self.agent.select_action(
+                    traj_obs, traj_mask, training=True
+                )
+
+                if not traj_mask[action]:
+                    feasible = np.where(traj_mask)[0]
+                    if len(feasible) > 0:
+                        action = int(np.random.choice(feasible))
+                        lp = 0.0
+                    else:
+                        break
+
+                next_obs, reward, terminated, truncated, info = self.env.step(action)
+                episode_return += reward
+
+                buffer.add(
+                    obs=traj_obs,
+                    action=action,
+                    reward=reward,
+                    done=(terminated or truncated),
+                    log_prob=lp,
+                    value=val,
+                    action_mask=traj_mask,
+                )
+
+                if terminated or truncated or not info["action_mask"].any():
+                    episode_returns.append(episode_return)
+                    break
+
+                traj_obs = next_obs
+                traj_mask = info["action_mask"]
+
+        return buffer, episode_returns
+
     def _update_policy(self, generator: Callable) -> Dict[str, float]:
         """
         Perform one POMO update using REINFORCEEstimator.
 
-        For a single problem instance:
-          1. Generate instance and reset environment
-          2. Get candidate starts via env.get_candidate_starts()
-          3. Collect complete episodes from each candidate directly into buffer
-          4. Track episode returns for logging
-          5. Compute loss via estimator.compute_loss()
-          6. Backprop and step optimizer
+        Steps:
+          1. Collect rollouts from multiple candidate starting points
+          2. Compute loss via estimator.compute_loss()
+          3. Backprop and step optimizer
+          4. Return metrics
         """
-        n_instances = 1
-        buffer = RolloutBuffer(capacity=self.tcfg.get("rollout_len", 2048))
-        total_steps = 0
-        episode_returns = []
+        buffer, episode_returns = self._collect(generator)
 
-        for _ in range(n_instances):
-            for attempt in range(100):
-                raw = generator()
-                obs, info = self.env.reset(raw)
-                if info["action_mask"].any():
-                    break
-            else:
-                continue
-
-            try:
-                candidates = self.env.get_candidate_starts()
-            except NotImplementedError:
-                candidates = [(self.env._current_state, obs, info)]
-
-            if not candidates:
-                continue
-
-            for state, start_obs, start_info in candidates:
-                if buffer.is_full:
-                    break
-
-                self.env._current_state = state
-                traj_obs = start_obs
-                traj_mask = start_info["action_mask"]
-                episode_return = 0.0
-
-                while not buffer.is_full:
-                    action, lp, val = self.agent.select_action(
-                        traj_obs, traj_mask, training=True
-                    )
-
-                    if not traj_mask[action]:
-                        feasible = np.where(traj_mask)[0]
-                        if len(feasible) > 0:
-                            action = int(np.random.choice(feasible))
-                            lp = 0.0
-                        else:
-                            break
-
-                    next_obs, reward, terminated, truncated, info = self.env.step(
-                        action
-                    )
-                    episode_return += reward
-
-                    buffer.add(
-                        obs=traj_obs,
-                        action=action,
-                        reward=reward,
-                        done=(terminated or truncated),
-                        log_prob=lp,
-                        value=val,
-                        action_mask=traj_mask,
-                    )
-
-                    total_steps += 1
-
-                    if terminated or truncated or not info["action_mask"].any():
-                        episode_returns.append(episode_return)
-                        break
-
-                    traj_obs = next_obs
-                    traj_mask = info["action_mask"]
-
-            if buffer.is_full:
-                break
-
-        if total_steps == 0 or buffer._ptr == 0:
+        if buffer._ptr == 0:
             return {
                 "train/pomo_loss": 0.0,
                 "train/avg_episode_return": 0.0,
@@ -1103,7 +1107,7 @@ class POMOTrainer(BaseTrainer):
         return {
             "train/pomo_loss": float(loss.item()),
             "train/avg_episode_return": avg_return,
-            "_steps": total_steps,
+            "_steps": buffer._ptr,
         }
 
     def _save_checkpoint(self, tag: str) -> None:
