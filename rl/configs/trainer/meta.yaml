@@ -1,0 +1,39 @@
+# trainer/meta.yaml
+# MAML (Model-Agnostic Meta-Learning) training configuration
+#
+# MAML trains policies that adapt quickly to new task distributions:
+# - Maintains a task pool with multiple problem sizes and distributions
+# - Inner loop: fast gradient steps on support set (K_inner iterations)
+# - Outer loop: meta-gradient update on query set
+# - Curriculum learning: gradually expand task difficulty during training
+
+trainer:
+  name: meta
+
+  meta_learning:
+    meta_agent:
+      name: policy
+      learning_rate: 0.001
+      optimizer: adam
+      rollout_length: 256
+  
+    sub_agent:
+      name: policy
+      learning_rate: 0.001
+      optimizer: adam
+      rollout_length: 256
+  
+    curriculum:
+      enabled: true
+      metric: entropy
+
+  fine_tuning:
+    sub_agent:
+      name: policy
+      learning_rate: 0.001
+      optimizer: adam
+      rollout_length: 256
+
+  evaluation:
+    eval_interval: 100
+    n_eval_episodes: 20

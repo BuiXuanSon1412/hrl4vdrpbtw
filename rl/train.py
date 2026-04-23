@@ -34,27 +34,20 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
-from typing import Any, Optional, Dict
-
-import torch.optim as optim
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config, merge_configs, save_config
 from core import (
     Evaluator,
-    FineTuner,
     Logger,
-    MetaTrainer,
     SeedManager,
 )
-from core.task import TaskManager, SimpleTask
 from registry import (
     build_agent,
-    build_problem,
-    build_task_pool,
-    get_generator,
-    sort_task_ids,
+    build_environment,
+    build_trainer,
+    get_vrpbtw_generator,
 )
 
 
@@ -144,11 +137,7 @@ def main() -> None:
     net_type = cfg.get("network", {}).get("type", "hgnn")
     device = cfg.get("device", "cpu")
     print(f"  Experiment : {exp_name}")
-    print(
-        f"  Algorithm  : {algo_name}  |  "
-        f"Network: {net_type}  |  "
-        f"Device: {device}"
-    )
+    print(f"  Algorithm  : {algo_name}  |  Network: {net_type}  |  Device: {device}")
 
     # ── 2. Reproducibility ──────────────────────────────────────────────
     reproducibility_cfg = cfg.get("reproducibility", {})
@@ -187,115 +176,46 @@ def main() -> None:
     save_config(cfg, str(config_path))
     print(f"  Config saved: {config_path}")
 
-    # ── 4. Build agent + trainer (dispatched by cfg.algorithm) ──────────
-    algo_name_lower = algo_name.lower()
-    if algo_name_lower == "maml":
-        task_pool = build_task_pool(cfg)
+    # ── 4. Build components using registry pattern ──────────────────────
+    # Build environment
+    env = build_environment(cfg)
+    print(f"  Environment: {type(env).__name__}")
 
-        # Build TaskManager from task pool
-        tasks = []
-        for task_id in sort_task_ids(list(task_pool.keys())):
-            problem, gen = task_pool[task_id]
-            task = SimpleTask(task_id=task_id, problem=problem, generator=gen)
-            tasks.append(task)
-        task_manager = TaskManager(tasks)
+    # Build agent (composes policy + estimator)
+    agent = build_agent(cfg=cfg)
+    print(f"  Agent      : {agent}\n")
 
-        # Use median task size as the fixed evaluation anchor during training.
-        # Full cross-size evaluation is done post-training with evaluate.py.
-        eval_task_ids = sort_task_ids(list(task_pool.keys()))
-        eval_task_id = eval_task_ids[len(eval_task_ids) // 2]
-        eval_problem, eval_gen = task_pool[eval_task_id]
-        print(f"  Tasks      : {eval_task_ids}  |  Eval anchor: {eval_task_id}")
+    # Create instance generator for training/evaluation
+    generator = get_vrpbtw_generator(cfg)
 
-        agent = build_agent(cfg=cfg)
-        print(f"  Agent      : {agent}\n")
+    # Build evaluator
+    eval_cfg = training_cfg.get("evaluation", cfg.get("evaluation", {}))
+    eval_decoding = eval_cfg.get("decoding", {})
+    n_eval_episodes = eval_cfg.get("n_eval_episodes", eval_cfg.get("n_episodes", 20))
+    deterministic = eval_cfg.get("deterministic", True)
+    beam_width = eval_decoding.get("beam_width", 1)
 
-        eval_cfg = training_cfg.get("evaluation", cfg.get("evaluation", {}))
-        eval_decoding = eval_cfg.get("decoding", {})
-        n_episodes = eval_cfg.get("n_episodes", 20)
-        deterministic = eval_cfg.get("deterministic", True)
-        beam_width = eval_decoding.get("beam_width", 1)
+    evaluator = Evaluator(
+        agent=agent,
+        env=env,
+        n_episodes=n_eval_episodes,
+        deterministic=deterministic,
+        beam_width=beam_width,
+    )
 
-        evaluator = Evaluator(
-            agent=agent,
-            env=eval_problem,
-            n_episodes=n_episodes,
-            deterministic=deterministic,
-            beam_width=beam_width,
-        )
+    # Build trainer using factory pattern (dispatched by cfg.trainer)
+    trainer = build_trainer(
+        cfg=cfg,
+        agent=agent,
+        env=env,
+        generator=generator,
+        evaluator=evaluator,
+        logger=logger,
+    )
+    print(f"  Trainer    : {type(trainer).__name__}\n")
 
-        trainer = MetaTrainer(
-            agent=agent,
-            task_manager=task_manager,
-            eval_problem=eval_problem,
-            eval_gen=eval_gen,
-            cfg=cfg,
-            evaluator=evaluator,
-            logger=logger,
-        )
-
-        # Phase 1: Meta-learning
-        phase1_summary = trainer.train()
-
-        best_ckpt_path = checkpoint_dir / f"{exp_name}_best.pt"
-        try:
-            agent.load(str(best_ckpt_path))
-            print(f"\nLoaded best checkpoint: {best_ckpt_path}")
-        except Exception as exc:
-            print(f"Could not load best checkpoint ({exc}); using final weights.")
-
-        algo_cfg = cfg.get("algorithm", {})
-        if isinstance(algo_cfg, str):
-            algo_cfg = cfg.get("maml", algo_cfg)  # Fallback to maml key for backward compatibility
-        task_pool_cfg = algo_cfg.get("task_pool", {})
-        task_sizes = task_pool_cfg.get("sizes", [10, 20, 50, 100])
-        eval_size = task_sizes[len(task_sizes) // 2]
-        phase1_eval = evaluator.evaluate(eval_gen)
-        _print_eval(phase1_eval, label=f"Phase 1 evaluation (n={eval_size})")
-
-        # Phase 2: Fine-tuning (optional)
-        fine_tuning_cfg = algo_cfg.get("fine_tuning", {})
-        ft_enabled = fine_tuning_cfg.get("enabled", False)
-        if ft_enabled:
-            print("\n" + "=" * 64)
-            print("  Phase 2: Task-Specific Fine-Tuning")
-            print("=" * 64)
-
-            fine_tuner = FineTuner(
-                agent=agent,
-                task_manager=trainer.task_manager,
-                cfg=cfg,
-            )
-            fine_tuner.initialize()
-
-            print(f"  Initialized {len(fine_tuner.get_all_agents())} task-specific agents\n")
-
-            # Phase 2: fine-tune each task
-            timestep = 0
-            ft_steps_per_task = fine_tuning_cfg.get("steps_per_task", 10)
-            ft_lr = fine_tuning_cfg.get("learning_rate", 0.001)
-            ft_total_steps = fine_tuning_cfg.get("total_steps", 100000)
-
-            for task_id in fine_tuner.get_all_agents().keys():
-                if timestep >= ft_total_steps:
-                    break
-
-                task = trainer.task_manager.get_task(task_id)
-                task_opt = optim.Adam(agent.policy.parameters(), lr=ft_lr)
-
-                print(f"  Fine-tuning task {task_id}...")
-                steps = fine_tuner.finetune_task(
-                    task_id=task_id,
-                    task_problem=task.problem,
-                    task_gen=task.generator,
-                    optimizer=task_opt,
-                    num_steps=ft_steps_per_task,
-                )
-                timestep += steps
-
-            phase2_eval = evaluator.evaluate(eval_gen)
-            fine_tuner.save_task_policies(str(checkpoint_dir))
-            _print_eval(phase2_eval, label=f"Phase 2 evaluation (n={eval_size})")
+    # ── 5. Training ─────────────────────────────────────────────────────
+    trainer.train()
 
 
 # ---------------------------------------------------------------------------

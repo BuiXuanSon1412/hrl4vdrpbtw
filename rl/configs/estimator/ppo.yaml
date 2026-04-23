@@ -1,0 +1,19 @@
+# estimator/ppo.yaml
+# PPO (Proximal Policy Optimization) loss configuration
+#
+# Controls loss computation and gradient-based training of the policy:
+# - gamma: discount factor for future rewards
+# - gae_lambda: GAE bias-variance tradeoff parameter
+# - value_coefficient: weight of value function loss
+# - entropy_coefficient: regularization to encourage exploration
+# - clip_eps: policy clipping ratio (prevents large policy updates)
+
+estimator:
+  name: ppo
+    
+  hparams:
+    gamma: 0.99
+    gae_lambda: 0.95
+    value_coefficient: 0.5
+    entropy_coefficient: 0.02
+    clip_eps: 0.2

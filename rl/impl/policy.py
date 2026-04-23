@@ -354,48 +354,30 @@ class VehicleDecoder(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-class VRPBTWPolicy(BasePolicy):
+class HGNNPolicy(BasePolicy):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
 
-        # Support hierarchical config structure
-        # Looks for nested keys first (e.g., cfg["backbone"]["embedding_dim"])
-        # then falls back to flat keys (e.g., cfg["embed_dim"]) for backward compatibility
-        def _get(key: str, default=None, nested_key: Optional[str] = None):
-            if nested_key and nested_key in cfg and key in cfg[nested_key]:
-                return cfg[nested_key][key]
-            if key in cfg:
-                return cfg[key]
-            return default
+        # Extract encoder and decoder configs
+        encoder_cfg = cfg.get("encoder", {})
+        decoder_cfg = cfg.get("decoder", {})
+        node_enc_cfg = encoder_cfg.get("node_encoder", {})
+        veh_enc_cfg = encoder_cfg.get("vehicle_encoder", {})
+        graph_enc_cfg = encoder_cfg.get("graph_encoder", {})
+        node_dec_cfg = decoder_cfg.get("node_decoder", {})
 
-        D: int = _get("embedding_dim", nested_key="backbone") or _get("embed_dim", 128) or 128
-        H: int = _get("n_heads", nested_key="backbone") or _get("n_heads", 4) or 4
-        drop: float = _get("dropout", nested_key="regularization") or _get("dropout", 0.1) or 0.1
-        use_in: bool = _get("use_instance_norm", nested_key="regularization") or _get("use_instance_norm", True) or True
-        clip: float = _get("clip_logits", nested_key="decoder") or _get("clip_logits", 10.0) or 10.0
+        # Read directly from current config structure
+        D: int = int(node_enc_cfg.get("embedding_dim", 128))
+        H: int = int(node_enc_cfg.get("n_heads", 4))
+        drop: float = float(node_enc_cfg.get("dropout", 0.1))
+        use_in: bool = bool(node_enc_cfg.get("use_instance_norm", True))
+        clip: float = float(node_dec_cfg.get("clip", 10.0))
 
-        # Encoder layers: each encoder can have different depth
-        # Check nested keys under "backbone" first
-        backbone = cfg.get("backbone", {})
-        n_node_layers: int = (
-            backbone.get("n_node_encoder_layers")
-            or backbone.get("n_encoder_layers")
-            or cfg.get("n_node_encoder_layers")
-            or cfg.get("n_encoder_layers", 3)
-        ) or 3
-        n_veh_layers: int = (
-            backbone.get("n_vehicle_encoder_layers")
-            or backbone.get("n_encoder_layers")
-            or cfg.get("n_vehicle_encoder_layers")
-            or cfg.get("n_encoder_layers", 3)
-        ) or 3
-        n_graph_layers: int = (
-            backbone.get("n_graph_encoder_layers")
-            or backbone.get("n_encoder_layers")
-            or cfg.get("n_graph_encoder_layers")
-            or cfg.get("n_encoder_layers", 3)
-        ) or 3
+        # Encoder layers: read per-encoder n_layers
+        n_node_layers: int = int(node_enc_cfg.get("n_layers", 3))
+        n_veh_layers: int = int(veh_enc_cfg.get("n_layers", 3))
+        n_graph_layers: int = int(graph_enc_cfg.get("n_layers", 3))
 
         self.node_encoder = NodeEncoder(D, H, n_node_layers, drop, use_in)
         self.vehicle_encoder = VehicleEncoder(D, H, n_veh_layers, drop, use_in)
@@ -404,9 +386,23 @@ class VRPBTWPolicy(BasePolicy):
         self.vehicle_decoder = VehicleDecoder(D, clip)
         self.value_head = nn.Sequential(nn.Linear(D * 3, D), nn.Tanh(), nn.Linear(D, 1))
 
-        ortho_init: bool = _get("ortho_init", nested_key="regularization") or _get("ortho_init", True) or True
+        ortho_init: bool = (
+            cfg.get("regularization", {}).get("ortho_init", True)
+            if isinstance(cfg.get("regularization"), dict)
+            else cfg.get("ortho_init", True)
+        )
         if ortho_init:
             self._ortho_init(self)
+
+    @classmethod
+    def from_config(cls, cfg: Dict) -> "HGNNPolicy":
+        """Factory method: instantiate HGNNPolicy from config dict.
+
+        Supports both old flat structure and new hierarchical structure with network key.
+        """
+        # Support both old (flat) and new (with network key) structure
+        policy_cfg = cfg.get("network", cfg)
+        return cls(cfg=policy_cfg)
 
     # ------------------------------------------------------------------
     # Helpers

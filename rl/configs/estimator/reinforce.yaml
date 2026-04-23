@@ -1,0 +1,8 @@
+estimator:
+  name: reinforce
+
+  hparams:
+    entropy_coef: 0.01
+    gamma: 0.99
+    baseline_mode: mean
+

@@ -48,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import load_config, merge_configs
 from core import Evaluator, SeedManager
-from registry import build_agent, build_problem, get_generator
+from registry import build_agent, build_environment, get_generator
 
 
 # ---------------------------------------------------------------------------
@@ -169,11 +169,11 @@ def main() -> None:
     seed_mgr.seed_everything()
     eval_rng = seed_mgr.make_eval_rng()  # fixed RNG → reproducible eval
 
-    # ── 3. Problem ──────────────────────────────────────────────────────
-    problem = build_problem(cfg)
+    # ── 3. Environment ──────────────────────────────────────────────────
+    env = build_environment(cfg)
     base_gen = get_generator(cfg)
 
-    print(f"  Problem    : {problem}")
+    print(f"  Environment: {env}")
 
     # ── 4. Instance generator (fixed eval RNG for reproducibility) ──────
     def instance_generator(size: Optional[int] = None, **_: Any) -> Any:
@@ -205,7 +205,7 @@ def main() -> None:
     # ── 7. Evaluate ─────────────────────────────────────────────────────
     evaluator = Evaluator(
         agent=agent,
-        env=problem,
+        env=env,
         n_episodes=n_episodes,
         deterministic=deterministic,
         n_samples=args.samples,

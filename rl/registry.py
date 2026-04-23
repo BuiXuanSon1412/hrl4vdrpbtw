@@ -16,52 +16,59 @@ Rules
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, List
 import numpy as np
+import torch.optim as optim
 
 # Problems
 from impl.environment import VRPBTWEnv
 
 # Networks
-from impl.policy import VRPBTWPolicy
+from impl.policy import HGNNPolicy
 
 # Core
-from core.agent import Agent, Agent
+from core.agent import PolicyAgent
 from core.policy import BasePolicy
-from core.estimator import PPOEstimator
+from core.estimator import BaseEstimator, PPOEstimator, REINFORCEEstimator
+from core.trainer import BaseTrainer, MetaTrainer, POMOTrainer
 
 _DEFAULT_DATA_ROOT = Path(__file__).resolve().parent.parent / "data"
 _GENERATED_ROOT = _DEFAULT_DATA_ROOT / "generated"
 
 # Add data/generated to sys.path for direct import
-sys.path.insert(0, str(_GENERATED_ROOT))
-from generate import create_instance  # type: ignore[import]
-
 
 # ---------------------------------------------------------------------------
-# Problem
+# Registry: factory method dispatch tables
 # ---------------------------------------------------------------------------
 
+_POLICY_REGISTRY: Dict[str, type] = {
+    "hgnn": HGNNPolicy,
+}
 
-def build_problem(cfg: Dict[str, Any]) -> VRPBTWEnv:
-    # Support hierarchical config structure
-    env_cfg = cfg.get("environment", cfg)
-    problem_cfg = env_cfg.get("problem", {})
-    name = problem_cfg.get("name", env_cfg.get("problem_name", "vrpbtw"))
-    problem_kwargs = problem_cfg.get("kwargs", env_cfg.get("problem_kwargs", {}))
-    kwargs = dict(problem_kwargs)
+_ESTIMATOR_REGISTRY: Dict[str, type] = {
+    "ppo": PPOEstimator,
+    "reinforce": REINFORCEEstimator,
+}
 
-    if name == "vrpbtw":
-        return VRPBTWEnv(
-            n_customers=kwargs.get("n_customers", 10),
-            n_fleets=kwargs.get("n_fleets", 2),
-        )
+_AGENT_REGISTRY: Dict[str, type] = {
+    "policy": PolicyAgent,
+}
 
-    raise ValueError(
-        f"Unknown problem {name!r}.  Register it in registry.py.  Known: ['vrpbtw']"
-    )
+_TRAINER_REGISTRY: Dict[str, type] = {
+    "meta": MetaTrainer,
+    "pomo": POMOTrainer,
+}
+
+_ENVIRONMENT_REGISTRY: Dict[str, type] = {
+    "vrpbtw": VRPBTWEnv,
+}
+
+_OPTIMIZER_REGISTRY: Dict[str, type] = {
+    "adam": optim.Adam,
+    "sgd": optim.SGD,
+    "adamw": optim.AdamW,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -69,230 +76,297 @@ def build_problem(cfg: Dict[str, Any]) -> VRPBTWEnv:
 # ---------------------------------------------------------------------------
 
 
-def _normalize_generated_instance(
-    data: Dict[str, Any], kwargs: Dict[str, Any]
-) -> Dict[str, Any]:
-    general = data["Config"]["General"]
-    vehicles = data["Config"]["Vehicles"]
-    depot = data["Config"]["Depot"]
+def _generate_coords(num_customers: int, max_coord: float, dist_type: str, rng: np.random.Generator) -> List[List[float]]:
+    """Generate customer coordinates based on distribution type (R, C, RC)."""
+    if dist_type == "R":
+        return rng.uniform(0, max_coord, size=(num_customers, 2)).tolist()
 
-    return {
-        "depot": list(depot["coord"]),
-        "customers": [
-            [
-                float(node["coord"][0]),
-                float(node["coord"][1]),
-                float(node["tw_h"][0]),
-                float(node["tw_h"][1]),
-                float(node["demand"]),
-            ]
-            for node in data["Nodes"]
-        ],
-        "n_fleets": int(vehicles["NUM_TRUCKS"]),
-        "truck_capacity": float(vehicles["CAPACITY_TRUCK"]),
-        "drone_capacity": float(vehicles["CAPACITY_DRONE"]),
-        "system_duration": float(general["T_MAX_SYSTEM_H"]),
-        "trip_duration": float(vehicles["DRONE_DURATION_H"]),
-        "truck_speed": float(vehicles["V_TRUCK_KM_H"]),
-        "drone_speed": float(vehicles["V_DRONE_KM_H"]),
-        "truck_cost": float(kwargs.get("truck_cost", 1.0)),
-        "drone_cost": float(kwargs.get("drone_cost", 0.5)),
-        "launch_time": float(vehicles["DRONE_TAKEOFF_MIN"]) / 60.0,
-        "land_time": float(vehicles["DRONE_LANDING_MIN"]) / 60.0,
-        "service_time": float(vehicles["SERVICE_TIME_MIN"]) / 60.0,
-        "lambda_weight": float(kwargs.get("lambda_weight", 0.5)),
-        "max_coord": float(general["MAX_COORD_KM"]),
-    }
+    elif dist_type == "C":
+        coords = []
+        remaining_nodes = num_customers
+
+        if num_customers <= 200:
+            std_dev = max_coord / 25
+        elif num_customers <= 400:
+            std_dev = max_coord / 32
+        else:
+            std_dev = max_coord / 40
+        min_dist = std_dev * 4
+
+        centers = []
+        while remaining_nodes > 0:
+            current_cluster_size = min(remaining_nodes, int(rng.uniform(10, 16)))
+
+            proposal = rng.uniform(5, max_coord - 5, size=(2,))
+            valid_center = False
+            attempts = 0
+            while not valid_center and attempts < 1000:
+                proposal = rng.uniform(5, max_coord - 5, size=(2,))
+                if not centers:
+                    valid_center = True
+                else:
+                    dists = [np.linalg.norm(proposal - np.array(c)) for c in centers]
+                    if min(dists) >= min_dist:
+                        valid_center = True
+                attempts += 1
+
+            centers.append(proposal.tolist())
+
+            for _ in range(current_cluster_size):
+                point = rng.normal(proposal, std_dev)
+                coords.append(np.clip(point, 0, max_coord).tolist())
+
+            remaining_nodes -= current_cluster_size
+
+        return coords
+
+    elif dist_type == "RC":
+        n_c = num_customers // 2
+        rng1 = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+        rng2 = np.random.default_rng(int(rng.integers(0, 2**31 - 1)))
+        return _generate_coords(n_c, max_coord, "C", rng1) + _generate_coords(
+            num_customers - n_c, max_coord, "R", rng2
+        )
+
+    raise ValueError(f"Unknown distribution type: {dist_type}")
 
 
-def _load_generated_config() -> Dict[str, Any]:
+def get_vrpbtw_generator(cfg: Dict[str, Any]) -> Callable[..., Any]:
+    """Get a VRPBTW instance generator from config.
+
+    Returns a generator function that accepts (size, dist, n_fleets, rng, **kwargs)
+    and creates normalized VRPBTW instances.
+    """
+    # Load config.json for demand ranges and other constants
     with (_GENERATED_ROOT / "config.json").open() as fh:
-        return json.load(fh)
+        data_cfg = json.load(fh)
 
+    env_cfg = cfg.get("environment", cfg)
+    props = env_cfg.get("properties", env_cfg)  # Support both old and new structure
 
-def get_generator(cfg: Dict[str, Any]) -> Callable[..., Any]:
-    # Support hierarchical config structure
-    env_cfg = cfg.get(
-        "environment", cfg
-    )  # Fallback to cfg if environment key not found
-    problem_cfg = env_cfg.get("problem", {})
-    name = problem_cfg.get("name", env_cfg.get("problem_name", "vrpbtw"))
+    def _generator(
+        size: int,
+        dist: str,
+        n_fleets: int,
+        rng=None,
+        **extra_kwargs: Any,
+    ) -> Dict[str, Any]:
+        if rng is None:
+            rng = np.random.default_rng(42)
 
-    if name == "vrpbtw":
-        problem_kwargs = problem_cfg.get("kwargs", {})
-        kwargs = dict(problem_kwargs)
-        generated_cfg = _load_generated_config()
+        max_coord = float(props.get("max_coord", 100.0))
+        t_max_system = float(props.get("t_max_system_h", 24.0))
+        ratio = float(extra_kwargs.get("ratio", 0.5))
 
-        def _generator(
-            size: Optional[int] = None,
-            rng=None,
-            **extra_kwargs: Any,
-        ) -> Dict[str, Any]:
-            n_customers = int(
-                size if size is not None else kwargs.get("n_customers", 10)
+        # Generate coordinates
+        coords = _generate_coords(size, max_coord, dist, rng)
+        depot_coord = [max_coord / 2.0, max_coord / 2.0]
+
+        # Generate customers with time windows and demands
+        customers = []
+        linehaul_count = int(size * ratio)
+        types = ["LINEHAUL"] * linehaul_count + ["BACKHAUL"] * (size - linehaul_count)
+        rng.shuffle(types)
+
+        for i in range(size):
+            node_type = types[i]
+            demand_range = (
+                data_cfg["DEMAND_RANGE_LINEHAUL"]
+                if node_type == "LINEHAUL"
+                else data_cfg["DEMAND_RANGE_BACKHAUL"]
             )
-            dist = str(extra_kwargs.get("dist", kwargs.get("coord_distribution", "RC")))
-            ratio = float(extra_kwargs.get("ratio", kwargs.get("linehaul_ratio", 0.5)))
-            seed_offset = int(
-                extra_kwargs.get(
-                    "generator_seed_offset",
-                    kwargs.get("generator_seed_offset", 0),
+
+            dist_km = np.linalg.norm(np.array(coords[i]) - np.array(depot_coord))
+            min_reach_time = dist_km / float(env_cfg.get("v_truck_km_h", 40.0))
+            ready_h = float(rng.uniform(min_reach_time * 1.1, t_max_system * 0.7))
+            width_h = float(
+                rng.uniform(
+                    1.0,
+                    1.0 + (data_cfg["TIME_WINDOW_SCALING_FACTOR"] * (dist_km / max_coord)),
                 )
             )
-            seed = (
-                int(rng.integers(0, 2**31 - 1)) + seed_offset
-                if rng is not None
-                else int(extra_kwargs.get("seed", kwargs.get("seed", 42))) + seed_offset
-            )
-            data = create_instance(generated_cfg, n_customers, dist, ratio, seed)
-            raw = _normalize_generated_instance(data, kwargs)
 
-            # Allow RL-specific overrides while keeping the data/generated pattern.
-            for key in (
-                "n_fleets",
-                "truck_capacity",
-                "drone_capacity",
-                "truck_speed",
-                "drone_speed",
-                "truck_cost",
-                "drone_cost",
-                "launch_time",
-                "land_time",
-                "service_time",
-                "trip_duration",
-                "lambda_weight",
-            ):
-                if key in kwargs:
-                    raw[key] = kwargs[key]
-                if key in extra_kwargs:
-                    raw[key] = extra_kwargs[key]
+            customers.append([
+                float(coords[i][0]),
+                float(coords[i][1]),
+                float(round(ready_h, 4)),
+                float(round(min(ready_h + width_h, t_max_system), 4)),
+                float(int(rng.integers(demand_range[0], demand_range[1] + 1))),
+            ])
 
-            return raw
+        raw = {
+            "depot": depot_coord,
+            "customers": customers,
+            "n_fleets": n_fleets,
+            "truck_capacity": float(props.get("capacity_truck", 200)),
+            "drone_capacity": float(props.get("capacity_drone", 20)),
+            "system_duration": t_max_system,
+            "trip_duration": float(props.get("drone_duration_h", 1.0)),
+            "truck_speed": float(props.get("v_truck_km_h", 40.0)),
+            "drone_speed": float(props.get("v_drone_km_h", 60.0)),
+            "truck_cost": float(props.get("truck_cost_unit", 1.0)),
+            "drone_cost": float(props.get("drone_cost_unit", 0.5)),
+            "launch_time": float(props.get("drone_takeoff_min", 1.0)) / 60.0,
+            "land_time": float(props.get("drone_landing_min", 1.0)) / 60.0,
+            "service_time": float(props.get("service_time_min", 5.0)) / 60.0,
+            "max_coord": max_coord,
+        }
 
-        return _generator
+        return raw
 
-    raise ValueError(f"No generator for problem {name!r}.  Known: ['vrpbtw']")
+    return _generator
 
 
-# ---------------------------------------------------------------------------
-# MAML task pool
-# ---------------------------------------------------------------------------
+def _parse_task_id(task_id: str) -> Tuple[int, int, str]:
+    """Parse task ID format: {difficulty}_N{customers}_F{fleets}_{distribution}.
 
-
-def build_task_pool(cfg: Dict[str, Any]) -> Dict[str, Tuple[Any, Callable]]:
+    Returns: (n_customers, n_fleets, distribution)
+    Example: "001_N10_F2_RC" -> (10, 2, "RC")
     """
-    Build a MAML task pool with multiple coordinate distributions.
+    parts = task_id.split("_")
+    if len(parts) < 4:
+        raise ValueError(f"Invalid task_id format: {task_id!r}")
+
+    try:
+        n_customers = int(parts[1][1:])  # Skip 'N'
+        n_fleets = int(parts[2][1:])  # Skip 'F'
+        dist = parts[3]
+    except (ValueError, IndexError) as e:
+        raise ValueError(f"Failed to parse task_id {task_id!r}: {e}")
+
+    return n_customers, n_fleets, dist
+
+
+def build_tasks(cfg: Dict[str, Any]) -> Dict[str, Tuple[Any, Callable]]:
+    """Build a MAML task pool from environment config.
 
     Task pool structure: {task_id: (VRPBTWEnv, generator_fn)}
-    Task ID format: "{size}_{distribution}" (e.g., "10_R", "20_C", "50_RC")
+    Task IDs come from environment.properties.tasks in config (format: {difficulty}_N{customers}_F{fleets}_{distribution})
+    Example: "001_N10_F2_RC"
 
-    Fleet sizes are read from data/generated/config.json FLEET_SIZES.
-    Each task-distribution combination gets its own seeded RNG for reproducibility.
-
-    The returned dict is compatible with MetaTrainer, which internally converts
-    the task pool into Task objects and a TaskManager for curriculum-based
-    meta-learning.
+    Each task gets its own seeded RNG for reproducibility.
+    The returned dict is compatible with MetaTrainer for curriculum-based meta-learning.
     """
-    # Support hierarchical config structure
-    algo_cfg = cfg.get("algorithm", {})
-    task_pool_cfg = algo_cfg.get("task_pool", {})
-    task_sizes = task_pool_cfg.get(
-        "sizes", cfg.get("maml", {}).get("task_sizes", [10, 20, 50, 100])
-    )
-    task_distributions = task_pool_cfg.get(
-        "distributions", cfg.get("maml", {}).get("task_distributions", ["RC"])
-    )
+    env_cfg = cfg.get("environment", cfg)
+    props_cfg = env_cfg.get("properties", env_cfg)
+    task_ids = props_cfg.get("tasks", [])
 
-    data_cfg = _load_generated_config()
-    fleet_map: Dict[int, int] = {
-        int(k): int(v) for k, v in data_cfg["FLEET_SIZES"].items()
-    }
+    if not task_ids:
+        raise ValueError("No tasks configured in environment.tasks")
 
-    base_gen = get_generator(cfg)
+    base_gen = get_vrpbtw_generator(cfg)
     pool: Dict[str, Tuple[Any, Callable]] = {}
 
-    for size in task_sizes:
-        n_fleets = fleet_map.get(size, 2)
+    reproducibility_cfg = cfg.get("reproducibility", {})
+    seed_cfg = reproducibility_cfg.get("seed", cfg.get("seed", {}))
+    global_seed = seed_cfg.get("global_seed", 42)
 
-        for dist in task_distributions:
-            task_id = f"{size}_{dist}"
+    for task_id in task_ids:
+        n_customers, n_fleets, dist = _parse_task_id(task_id)
 
-            # Create problem instance for this size/distribution combo
-            problem = VRPBTWEnv(n_customers=size, n_fleets=n_fleets)
+        # Create generic environment instance (instance-specific params set in reset)
+        env = build_environment(cfg)
 
-            # Each task has a dedicated RNG: hash of (size, dist) ensures determinism
-            # while keeping distinct streams for different tasks
-            reproducibility_cfg = cfg.get("reproducibility", {})
-            seed_cfg = reproducibility_cfg.get("seed", cfg.get("seed", {}))
-            global_seed = seed_cfg.get("global_seed", 42)
-            _rng = np.random.default_rng(global_seed + hash((size, dist)) % (2**31 - 1))
+        # Deterministic RNG per task
+        task_seed = global_seed + hash((n_customers, n_fleets, dist)) % (2**31 - 1)
+        _rng = np.random.default_rng(task_seed)
 
-            # Closure captures size, distribution, fleet count, and RNG
-            gen = _make_task_generator(size, dist, n_fleets, base_gen, _rng)
-            pool[task_id] = (problem, gen)
+        # Closure captures task parameters and RNG
+        def _gen(n=n_customers, d=dist, nf=n_fleets, rng=_rng) -> Dict[str, Any]:
+            return base_gen(size=n, dist=d, n_fleets=nf, rng=rng)
+
+        pool[task_id] = (env, _gen)
 
     return pool
 
 
-def _make_task_generator(
-    size: int,
-    dist: str,
-    n_fleets: int,
-    base_gen: Callable,
-    rng: np.random.Generator,
-) -> Callable:
-    """Factory for task-specific generators with captured parameters."""
-
-    def _gen() -> Dict[str, Any]:
-        return base_gen(size=size, dist=dist, n_fleets=n_fleets, rng=rng)
-
-    return _gen
-
-
-def _parse_task_id(task_id: str) -> Tuple[int, str]:
-    """Parse task ID string (format: "{size}_{dist}") into (size, dist) tuple.
-
-    Used for proper sorting of task IDs by size (numeric) then distribution (alphabetic).
-    """
-    parts = task_id.rsplit("_", 1)
-    if len(parts) != 2:
-        raise ValueError(
-            f"Invalid task_id format: {task_id!r}. Expected '{{size}}_{{dist}}'"
-        )
-    try:
-        size = int(parts[0])
-    except ValueError:
-        raise ValueError(f"Invalid size in task_id {task_id!r}: {parts[0]!r}")
-    return size, parts[1]
-
-
-def sort_task_ids(task_ids: List[str]) -> List[str]:
-    """Sort task IDs by size (numeric) then distribution (alphabetic).
-
-    Examples:
-        ["10_R", "100_C", "10_C"] → ["10_C", "10_R", "100_C"]
-    """
-    return sorted(task_ids, key=_parse_task_id)
-
-
 # ---------------------------------------------------------------------------
-# Network
+# Trainer
 # ---------------------------------------------------------------------------
 
 
-def build_network(
+def build_trainer(
     cfg: Dict[str, Any],
-) -> BasePolicy:
-    net_cfg = cfg["network"]
-    net_type = net_cfg.get("type") or net_cfg.get("network_type", "hgnn")
+    agent: Any,
+    env: Any,
+    generator: Callable,
+    evaluator: Any,
+    logger: Any,
+) -> BaseTrainer:
+    """Build trainer from config.
 
-    if net_type == "hgnn":
-        return VRPBTWPolicy(cfg=net_cfg)
+    Dispatches to registry based on trainer type, then calls from_config.
+    Builds task pool (all trainers train on multiple tasks sequentially).
+    """
+    trainer_cfg = cfg.get("trainer", {})
+    trainer_type = trainer_cfg.get("name", "meta")
 
-    raise ValueError(
-        f"Unknown network type {net_type!r}.  "
-        f"Register it in registry.py.  Known: ['hgnn']"
+    if trainer_type not in _TRAINER_REGISTRY:
+        raise ValueError(
+            f"Unknown trainer type {trainer_type!r}. "
+            f"Register it in registry.py. Known: {list(_TRAINER_REGISTRY.keys())}"
+        )
+
+    cls = _TRAINER_REGISTRY[trainer_type]
+
+    # Build task pool: all trainers use this (train multiple tasks sequentially)
+    tasks = build_tasks(cfg)
+
+    return cls.from_config(
+        cfg=cfg,
+        agent=agent,
+        env=env,
+        tasks=tasks,
+        evaluator=evaluator,
+        logger=logger,
     )
+
+
+# ---------------------------------------------------------------------------
+# Network / Policy
+# ---------------------------------------------------------------------------
+
+
+def build_policy(cfg: Dict[str, Any]) -> BasePolicy:
+    """Build policy network from config.
+
+    Dispatches to registry based on policy name, then calls from_config.
+    """
+    policy_cfg = cfg.get("policy", cfg.get("network", {}))  # Support both old and new
+    net_type = policy_cfg.get("name", policy_cfg.get("type", "hgnn"))
+
+    if net_type not in _POLICY_REGISTRY:
+        raise ValueError(
+            f"Unknown network type {net_type!r}. "
+            f"Register it in registry.py. Known: {list(_POLICY_REGISTRY.keys())}"
+        )
+
+    cls = _POLICY_REGISTRY[net_type]
+    return cls.from_config(policy_cfg)
+
+
+# ---------------------------------------------------------------------------
+# Estimator
+# ---------------------------------------------------------------------------
+
+
+def build_estimator(cfg: Dict[str, Any], estimator_name: Optional[str] = None) -> BaseEstimator:
+    """Build estimator from config.
+
+    Dispatches to registry based on estimator type, then calls from_config.
+    """
+    # Get estimator name from parameter or config
+    if estimator_name is None:
+        estimator_name = cfg.get("estimator", {}).get("name", "ppo")
+
+    if estimator_name not in _ESTIMATOR_REGISTRY:
+        raise ValueError(
+            f"Unknown estimator type {estimator_name!r}. "
+            f"Register it in registry.py. Known: {list(_ESTIMATOR_REGISTRY.keys())}"
+        )
+
+    cls = _ESTIMATOR_REGISTRY[estimator_name]
+    return cls.from_config(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -300,30 +374,71 @@ def build_network(
 # ---------------------------------------------------------------------------
 
 
-def build_agent(cfg: Dict[str, Any]) -> Agent:
-    network = build_network(cfg)
+def build_agent(cfg: Dict[str, Any]) -> PolicyAgent:
+    """Build agent from config.
+
+    Reads agent configuration from trainer config, then composes policy,
+    estimator, optimizer, and agent via their from_config methods.
+    """
     device = cfg.get("device", "cpu")
-    network = network.to_device(device)
 
-    # Build estimator (PPO for all algorithms)
-    algo_cfg = cfg.get("algorithm", {})
-    if isinstance(algo_cfg, dict):
-        algo_name = algo_cfg.get("name", "").lower()
-    else:
-        algo_name = str(algo_cfg).lower()
+    # Get agent config from trainer (supports both meta and pomo)
+    trainer_cfg = cfg.get("trainer", {})
+    agent_cfg = trainer_cfg.get("agent", trainer_cfg.get("meta_learning", {}).get("meta_agent", {}))
 
-    # Extract RL objective config (works for both MAML and single-env)
-    rl_obj_cfg = algo_cfg.get("rl_objective", {}) if isinstance(algo_cfg, dict) else {}
-    if not rl_obj_cfg:
-        rl_obj_cfg = cfg.get("rl_objective", {})
+    # Build policy
+    policy = build_policy(cfg)
+    policy = policy.to_device(device)
 
-    estimator = PPOEstimator(
-        device=device,
-        gamma=rl_obj_cfg.get("gamma", 0.99),
-        gae_lambda=rl_obj_cfg.get("gae_lambda", 0.95),
-        value_coef=rl_obj_cfg.get("value_coefficient", 0.5),
-        entropy_coef=rl_obj_cfg.get("entropy_coefficient", 0.02),
-        clip_ratio=rl_obj_cfg.get("clip_eps", 0.2),
-    )
+    # Build estimator using the estimator name from agent config
+    estimator_name = agent_cfg.get("estimator", "ppo")
+    estimator = build_estimator(cfg, estimator_name=estimator_name)
 
-    return Agent(policy=network, estimator=estimator, device=device)
+    # Build optimizer
+    opt_type = agent_cfg.get("optimizer", "adam")
+    opt_lr = agent_cfg.get("learning_rate", 0.001)
+
+    if opt_type not in _OPTIMIZER_REGISTRY:
+        raise ValueError(
+            f"Unknown optimizer type {opt_type!r}. "
+            f"Register it in registry.py. Known: {list(_OPTIMIZER_REGISTRY.keys())}"
+        )
+
+    opt_class = _OPTIMIZER_REGISTRY[opt_type]
+    optimizer = opt_class(policy.parameters(), lr=opt_lr)
+
+    # Build agent
+    agent_type = agent_cfg.get("name", "policy")
+    if agent_type not in _AGENT_REGISTRY:
+        raise ValueError(
+            f"Unknown agent type {agent_type!r}. "
+            f"Register it in registry.py. Known: {list(_AGENT_REGISTRY.keys())}"
+        )
+
+    cls = _AGENT_REGISTRY[agent_type]
+    return cls.from_config(cfg, policy, estimator, optimizer)
+
+
+# ---------------------------------------------------------------------------
+# Environment
+# ---------------------------------------------------------------------------
+
+
+def build_environment(cfg: Dict[str, Any]) -> VRPBTWEnv:
+    """Build environment from config.
+
+    Dispatches to registry based on environment name, then calls from_config.
+    Instance-specific parameters are determined dynamically in reset() via raw_instance.
+    """
+    # Support hierarchical config structure
+    env_cfg = cfg.get("environment", cfg)
+    env_name = env_cfg.get("name", "vrpbtw")
+
+    if env_name not in _ENVIRONMENT_REGISTRY:
+        raise ValueError(
+            f"Unknown environment {env_name!r}. "
+            f"Register it in registry.py. Known: {list(_ENVIRONMENT_REGISTRY.keys())}"
+        )
+
+    cls = _ENVIRONMENT_REGISTRY[env_name]
+    return cls.from_config(env_cfg)

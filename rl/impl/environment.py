@@ -112,12 +112,14 @@ def _copy_state(s: VRPBTWState) -> VRPBTWState:
 
 
 class VRPBTWEnv(Environment):
-    def __init__(self, n_customers: int = 10, n_fleets: int = 2):
+    def __init__(self, cfg: Dict[str, Any]):
         super().__init__(name="VRPBTW")
-        self.n_customers = n_customers
-        self.n_fleets = n_fleets
-        self.K = n_fleets
+        # Instance parameters (set dynamically in reset via encode_instance)
+        self.n_customers: int = 10
+        self.n_fleets: int = 2
+        self.K: int = 2
 
+        # Static node feature arrays (placeholder, resized in encode_instance)
         self.coords: np.ndarray = np.zeros((1, 2), dtype=np.float32)
         self.demands: np.ndarray = np.zeros(1, dtype=np.float32)
         self.tw_open: np.ndarray = np.zeros(1, dtype=np.float32)
@@ -126,20 +128,32 @@ class VRPBTWEnv(Environment):
         self.manhattan_dist: np.ndarray = np.zeros((1, 1), dtype=np.float32)
         self.euclidean_dist: np.ndarray = np.zeros((1, 1), dtype=np.float32)
 
-        self.Q_t: float = 1.0
-        self.Q_d: float = 1.0
-        self.T_max: float = 1.0
-        self.t_max: float = 1.0
-        self.v_t: float = 1.0
-        self.v_d: float = 2.0
-        self.c_t: float = 1.0
-        self.c_d: float = 0.5
-        self.launch_time: float = 0.0
-        self.land_time: float = 0.0
-        self.max_coord: float = 100.0  # coordinate bound from config
+        # Static environment parameters from config
+        self.max_coord: float = float(cfg.get("max_coord", 100.0))
+        self.Q_t: float = float(cfg.get("capacity_truck", 200.0))
+        self.Q_d: float = float(cfg.get("capacity_drone", 20.0))
+        self.T_max: float = float(cfg.get("t_max_system_h", 24.0))
+        self.t_max: float = float(cfg.get("drone_duration_h", 1.0))
+        self.v_t: float = float(cfg.get("v_truck_km_h", 40.0))
+        self.v_d: float = float(cfg.get("v_drone_km_h", 60.0))
+        self.c_t: float = float(cfg.get("truck_cost_unit", 1.0))
+        self.c_d: float = float(cfg.get("drone_cost_unit", 0.5))
+        self.launch_time: float = float(cfg.get("drone_takeoff_min", 1.0)) / 60.0
+        self.land_time: float = float(cfg.get("drone_landing_min", 1.0)) / 60.0
 
         self._linehaul_idx: np.ndarray = np.array([], dtype=np.int32)
         self._backhaul_idx: np.ndarray = np.array([], dtype=np.int32)
+
+    @classmethod
+    def from_config(cls, cfg: Dict) -> "VRPBTWEnv":
+        """Factory method: instantiate VRPBTWEnv from config dict.
+
+        Instance-specific parameters (n_customers, n_fleets) are set dynamically
+        in reset() via encode_instance() when raw_instance is provided.
+        """
+        # Support both old (flat) and new (properties) structure
+        props = cfg.get("properties", cfg)
+        return cls(props)
 
     # ------------------------------------------------------------------
     # encode_instance

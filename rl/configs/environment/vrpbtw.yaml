@@ -1,0 +1,47 @@
+# environment/vrpbtw.yaml
+# Vehicle Routing Problem with Time Windows and Drone Delivery
+#
+# Static environment parameters (vehicle specs, network properties)
+# Dynamic instance parameters (n_customers, n_fleets, coordinates) come from raw_instance
+
+environment:
+  name: vrpbtw
+  properties:
+    # Coordinate system bounds
+    max_coord: 100.0
+
+    # Vehicle capacities
+    capacity_truck: 200
+    capacity_drone: 20
+
+    # Vehicle speeds (km/h)
+    v_truck_km_h: 40.0
+    v_drone_km_h: 60.0
+
+    # Vehicle costs (per unit distance)
+    truck_cost_unit: 1.0
+    drone_cost_unit: 0.5
+
+    # System time windows (hours)
+    t_max_system_h: 24.0
+    drone_duration_h: 1.0
+
+    # Drone operation times (minutes)
+    drone_takeoff_min: 1.0
+    drone_landing_min: 1.0
+    service_time_min: 5.0
+    # Available tasks for training/evaluation
+    # Format: {difficulty:003d}_N{customers}_F{fleets}_{distribution}
+    tasks:
+      - 001_N10_F2_RC
+      - 002_N10_F2_R
+      - 003_N10_F2_C
+      - 004_N20_F3_RC
+      - 005_N20_F3_R
+      - 006_N20_F3_C
+      - 007_N50_F5_RC
+      - 008_N50_F5_R
+      - 009_N50_F5_C
+      - 010_N100_F10_RC
+      - 011_N100_F10_R
+      - 012_N100_F10_C

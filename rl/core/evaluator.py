@@ -26,8 +26,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from core.agent import Agent
+from core.agent import BaseAgent
 from core.environment import Environment, Solution, SolutionPool
+from core.utils import obs_to_tensor
 
 
 class Evaluator:
@@ -46,7 +47,7 @@ class Evaluator:
 
     def __init__(
         self,
-        agent: Agent,
+        agent: BaseAgent,
         env: Environment,
         n_episodes: int = 20,
         deterministic: bool = True,
@@ -212,9 +213,8 @@ class Evaluator:
             lp[mask] = 0.0
             return lp
 
-        obs_t = self.agent.prepare_obs(obs)
-
         device = next(network.parameters()).device
+        obs_t = obs_to_tensor(obs, str(device))
         if isinstance(obs_t, dict):
             obs_t = {
                 k: (v.to(device) if isinstance(v, torch.Tensor) else v)

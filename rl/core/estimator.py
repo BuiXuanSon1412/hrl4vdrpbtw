@@ -13,16 +13,15 @@ compute the total loss for a parameter update.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Dict
 
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 
 from core.buffer import RolloutBuffer
-from core.agent import _obs_to_tensor
 from core.policy import BasePolicy
+from core.utils import obs_to_tensor
 
 
 class BaseEstimator(ABC):
@@ -34,6 +33,12 @@ class BaseEstimator(ABC):
 
     def __init__(self, device: str = "cpu", **kwargs: Any):
         self.device = device
+
+    @classmethod
+    @abstractmethod
+    def from_config(cls, cfg: Dict[str, Any]) -> "BaseEstimator":
+        """Factory method: instantiate estimator from config dict."""
+        ...
 
     @abstractmethod
     def compute_loss(self, policy: BasePolicy, buffer: RolloutBuffer) -> torch.Tensor:
@@ -66,6 +71,129 @@ class BaseEstimator(ABC):
         return 0.0
 
 
+class REINFORCEEstimator(BaseEstimator):
+    """
+    REINFORCE with baseline: -log π(a|s) * (G_t - baseline)
+
+    Loss = -1/N * sum_t(log_prob_t * advantage_t)
+    where advantage_t = return_t - baseline (or value_t if using critic)
+    """
+
+    def __init__(
+        self,
+        device: str = "cpu",
+        gamma: float = 0.99,
+        entropy_coef: float = 0.01,
+        baseline_mode: str = "mean",
+    ):
+        """
+        Args:
+            device: device string (cpu/cuda)
+            gamma: discount factor for return computation
+            entropy_coef: weight for entropy bonus
+            baseline_mode: "mean" (mean return) or "value" (use critic value)
+        """
+        super().__init__(device=device)
+        self.gamma = gamma
+        self.entropy_coef = entropy_coef
+        self.baseline_mode = baseline_mode
+
+    @classmethod
+    def from_config(cls, cfg: Dict[str, Any]) -> "REINFORCEEstimator":
+        """Factory method: instantiate REINFORCE estimator from config dict.
+
+        Config keys:
+        - device: device string (cpu/cuda)
+        - estimator.hparams: dict with gamma, entropy_coef, baseline_mode
+        """
+        device = cfg.get("device", "cpu")
+        # Read from estimator.hparams
+        estimator_cfg = cfg.get("estimator", {})
+        obj_cfg = estimator_cfg.get("hparams", {}) if isinstance(estimator_cfg, dict) else {}
+
+        return cls(
+            device=device,
+            gamma=obj_cfg.get("gamma", 0.99),
+            entropy_coef=obj_cfg.get("entropy_coef", 0.01),
+            baseline_mode=obj_cfg.get("baseline_mode", "mean"),
+        )
+
+    def compute_loss(self, policy: BasePolicy, buffer: RolloutBuffer) -> torch.Tensor:
+        """
+        Compute REINFORCE loss over all transitions in the buffer.
+
+        For each transition:
+          - Compute return: discounted sum of future rewards
+          - Compute baseline: mean return or critic value
+          - Advantage = return - baseline
+          - Loss = -log_prob * advantage - entropy_bonus
+        """
+        n = buffer._ptr
+        if n == 0:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        # Compute returns (discounted cumulative rewards)
+        returns = self._compute_returns(buffer)
+
+        # Compute baseline
+        if self.baseline_mode == "mean":
+            baseline = float(np.mean(returns))
+        else:
+            baseline = 0.0
+
+        total_loss = None
+        for i, tr in enumerate(buffer._data[:n]):
+            obs_t = obs_to_tensor(tr.obs, self.device)
+            act_t = torch.tensor([tr.action], dtype=torch.long, device=self.device)
+            mask_t = torch.tensor(
+                tr.action_mask, dtype=torch.bool, device=self.device
+            ).unsqueeze(0)
+
+            # Evaluate current policy
+            log_prob, value, entropy = policy.evaluate_actions(obs_t, act_t, mask_t)
+
+            # Compute advantage
+            ret = torch.tensor([returns[i]], dtype=torch.float32, device=self.device)
+            if self.baseline_mode == "value":
+                advantage = ret - value
+            else:
+                advantage = ret - baseline
+
+            # REINFORCE loss: -log_prob * advantage
+            policy_loss = -log_prob * advantage
+
+            # Entropy bonus
+            entropy_loss = -entropy
+
+            loss_i = (
+                policy_loss + self.entropy_coef * entropy_loss
+            ) / n
+            total_loss = loss_i if total_loss is None else total_loss + loss_i
+
+        return (
+            total_loss
+            if total_loss is not None
+            else torch.tensor(0.0, device=self.device, requires_grad=True)
+        )
+
+    def _compute_returns(self, buffer: RolloutBuffer) -> list:
+        """
+        Compute discounted cumulative returns for each transition.
+
+        Returns[t] = sum_{k=0}^{n-t-1} gamma^k * reward[t+k]
+        """
+        n = buffer._ptr
+        returns = [0.0] * n
+        cumsum = 0.0
+
+        for t in reversed(range(n)):
+            tr = buffer._data[t]
+            cumsum = tr.reward + self.gamma * cumsum * (1.0 - float(tr.done))
+            returns[t] = cumsum
+
+        return returns
+
+
 class PPOEstimator(BaseEstimator):
     """
     PPO loss with clipped objective, value loss, and entropy regularization.
@@ -89,6 +217,28 @@ class PPOEstimator(BaseEstimator):
         self.gamma = gamma
         self.gae_lambda = gae_lambda
 
+    @classmethod
+    def from_config(cls, cfg: Dict[str, Any]) -> "PPOEstimator":
+        """Factory method: instantiate PPO estimator from config dict.
+
+        Config keys:
+        - device: device string (cpu/cuda)
+        - estimator.hparams: dict with gamma, gae_lambda, value_coefficient, entropy_coefficient, clip_eps
+        """
+        device = cfg.get("device", "cpu")
+        # Read from estimator.hparams
+        estimator_cfg = cfg.get("estimator", {})
+        obj_cfg = estimator_cfg.get("hparams", {}) if isinstance(estimator_cfg, dict) else {}
+
+        return cls(
+            device=device,
+            gamma=obj_cfg.get("gamma", 0.99),
+            gae_lambda=obj_cfg.get("gae_lambda", 0.95),
+            value_coef=obj_cfg.get("value_coefficient", 0.5),
+            entropy_coef=obj_cfg.get("entropy_coefficient", 0.01),
+            clip_ratio=obj_cfg.get("clip_eps", 0.2),
+        )
+
     def compute_loss(self, policy: BasePolicy, buffer: RolloutBuffer) -> torch.Tensor:
         """
         Compute PPO loss over all transitions in the buffer.
@@ -109,15 +259,13 @@ class PPOEstimator(BaseEstimator):
 
         total_loss = None
         for i, tr in enumerate(buffer._data[:n]):
-            obs_t = _obs_to_tensor(tr.obs, self.device)
+            obs_t = obs_to_tensor(tr.obs, self.device)
             act_t = torch.tensor([tr.action], dtype=torch.long, device=self.device)
             mask_t = torch.tensor(
                 tr.action_mask, dtype=torch.bool, device=self.device
             ).unsqueeze(0)
             adv = torch.tensor([advantages[i]], dtype=torch.float32, device=self.device)
-            ret = torch.tensor(
-                [returns[i]], dtype=torch.float32, device=self.device
-            )
+            ret = torch.tensor([returns[i]], dtype=torch.float32, device=self.device)
             old_log_prob = torch.tensor(
                 [tr.log_prob], dtype=torch.float32, device=self.device
             )
@@ -144,7 +292,11 @@ class PPOEstimator(BaseEstimator):
             ) / n
             total_loss = loss_i if total_loss is None else total_loss + loss_i
 
-        return total_loss if total_loss is not None else torch.tensor(0.0, device=self.device, requires_grad=True)
+        return (
+            total_loss
+            if total_loss is not None
+            else torch.tensor(0.0, device=self.device, requires_grad=True)
+        )
 
     def _compute_advantages(self, buffer: RolloutBuffer) -> list:
         """
@@ -180,8 +332,5 @@ class PPOEstimator(BaseEstimator):
 
     def _compute_returns(self, buffer: RolloutBuffer, advantages: list) -> list:
         """Compute value targets as return = V_old(s_t) + advantage."""
-        returns = [
-            buffer._data[i].value + advantages[i]
-            for i in range(buffer._ptr)
-        ]
+        returns = [buffer._data[i].value + advantages[i] for i in range(buffer._ptr)]
         return returns

@@ -50,6 +50,14 @@ def load_config(path: str) -> Dict[str, Any]:
     """
     Load configuration from YAML or JSON file.
 
+    Supports _include key to load and merge component configs:
+        _include:
+          - trainer: configs/trainer/pomo.yaml
+          - policy: configs/policy/hgnn.yaml
+          - estimator: configs/estimator/ppo.yaml
+
+    Included configs are merged in order, then main config merged on top.
+
     Args:
         path: path to config file (.yaml or .json)
 
@@ -57,7 +65,29 @@ def load_config(path: str) -> Dict[str, Any]:
         dict with all configuration keys
     """
     fmt = _infer_format(path)
-    return _load_yaml(path) if fmt == "yaml" else _load_json(path)
+    cfg = _load_yaml(path) if fmt == "yaml" else _load_json(path)
+
+    # Process _include directives
+    if "_include" in cfg:
+        includes = cfg.pop("_include")
+        if not isinstance(includes, list):
+            includes = [includes]
+
+        result = {}
+        for inc in includes:
+            if isinstance(inc, dict):
+                for component_name, component_path in inc.items():
+                    component_path = Path(path).parent / component_path
+                    component_cfg = load_config(str(component_path))
+                    result = _deep_merge(result, component_cfg)
+            elif isinstance(inc, str):
+                component_path = Path(path).parent / inc
+                component_cfg = load_config(str(component_path))
+                result = _deep_merge(result, component_cfg)
+
+        cfg = _deep_merge(result, cfg)
+
+    return cfg
 
 
 def _deep_merge(base: Dict, override: Dict) -> Dict:

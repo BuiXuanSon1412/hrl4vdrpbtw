@@ -14,8 +14,8 @@ from __future__ import annotations
 import hashlib
 import math
 import random
-from typing import Optional
-
+from typing import Any, Optional, Union
+import torch
 import numpy as np
 
 
@@ -161,3 +161,47 @@ class SeedManager:
             f"SeedManager(global={self.global_seed}, "
             f"env={self.env_seed}, data={self.data_seed})"
         )
+
+
+# ---------------------------------------------------------------------------
+# Observation Conversion
+# ---------------------------------------------------------------------------
+
+
+def obs_to_tensor(
+    obs: Any,
+    device: str = "cpu",
+) -> Union[Any, "torch.Tensor"]:
+    """
+    Convert observation to tensor with batch dimension (B=1).
+
+    Handles both dict observations (graph data) and array observations.
+    - Dict keys ending with "edge_index" → int64 tensors
+    - Other dict values → float32 tensors
+    - Array observations → float32 tensors
+
+    Args:
+        obs: observation dict or array (no batch dimension)
+        device: torch device (cpu, cuda, etc.)
+
+    Returns:
+        Tensorized observation with batch dimension added (B=1)
+    """
+    import torch
+
+    if isinstance(obs, dict):
+        result: dict = {}
+        for k, v in obs.items():
+            if isinstance(v, np.ndarray):
+                dtype = torch.long if "edge_index" in k else torch.float32
+                result[k] = torch.tensor(v, dtype=dtype, device=device).unsqueeze(0)
+            elif isinstance(v, torch.Tensor):
+                result[k] = v.to(device).unsqueeze(0)
+            else:
+                result[k] = v
+        return result
+
+    if isinstance(obs, np.ndarray):
+        return torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)
+
+    return torch.tensor(obs, dtype=torch.float32, device=device).unsqueeze(0)

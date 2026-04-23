@@ -10,11 +10,6 @@ trained — that is entirely the trainer's responsibility.
                                      save, load, clone)
   PolicyAgent  — single concrete implementation; works with any trainer
 
-Module-level helpers
---------------------
-  _obs_to_tensor   — convert a single obs dict to a B=1 tensor
-
-This helper is used by estimators to tensorize observations.
 """
 
 from __future__ import annotations
@@ -42,7 +37,6 @@ class BaseAgent(ABC):
     Policy contract: obs → action.
 
     An agent holds a policy network and knows how to:
-      - tensorise an observation (prepare_obs)
       - select an action given an observation and mask (select_action)
       - persist and restore the network weights (save / load)
       - produce an independent copy of itself (clone)
@@ -62,9 +56,12 @@ class BaseAgent(ABC):
         """The loss estimator (optional, used for training)."""
         return None
 
+    @classmethod
     @abstractmethod
-    def prepare_obs(self, obs: Any) -> Any:
-        """Add batch dimension and tensorize a single obs dict."""
+    def from_config(
+        cls, cfg: dict, policy: BasePolicy, estimator: Optional[Any], opt_policy: Optional[optim.Optimizer] = None
+    ) -> "BaseAgent":
+        """Factory method: instantiate agent from config, policy, estimator, and optimizer."""
         ...
 
     @abstractmethod
@@ -97,16 +94,14 @@ class BaseAgent(ABC):
 # ---------------------------------------------------------------------------
 
 
-class Agent(BaseAgent):
+class PolicyAgent(BaseAgent):
     """
-    Policy agent with learnable policy and value functions.
+    Policy-only agent for RL training.
 
     Properties:
       policy      — policy network (π_θ)
-      value_fn    — value function network (V_ϕ, if separate from policy)
-      estimator   — loss computation (PPO, A2C, etc.)
+      estimator   — loss computation (PPO, A2C, REINFORCE, etc.)
       opt_policy  — optimizer for policy
-      opt_value   — optimizer for value function
 
     Methods:
       select_action(obs, mask, training) — sample or greedy action
@@ -118,24 +113,16 @@ class Agent(BaseAgent):
         policy: BasePolicy,
         estimator: Optional[Any] = None,
         opt_policy: Optional[optim.Optimizer] = None,
-        opt_value: Optional[optim.Optimizer] = None,
-        value_fn: Optional[BasePolicy] = None,
         device: str = "cpu",
     ):
         self._policy = policy
-        self._value_fn = value_fn or policy
         self._estimator = estimator
         self._opt_policy = opt_policy
-        self._opt_value = opt_value
         self.device = device
 
     @property
     def policy(self) -> BasePolicy:
         return self._policy
-
-    @property
-    def value_fn(self) -> BasePolicy:
-        return self._value_fn
 
     @property
     def estimator(self) -> Optional[Any]:
@@ -145,30 +132,17 @@ class Agent(BaseAgent):
     def opt_policy(self) -> Optional[optim.Optimizer]:
         return self._opt_policy
 
-    @property
-    def opt_value(self) -> Optional[optim.Optimizer]:
-        return self._opt_value
+    @classmethod
+    def from_config(
+        cls, cfg: dict, policy: BasePolicy, estimator: Optional[Any], opt_policy: Optional[optim.Optimizer] = None
+    ) -> "PolicyAgent":
+        """Factory method: instantiate PolicyAgent from config, policy, estimator, and optimizer.
 
-    # ------------------------------------------------------------------
-    # Observation helpers
-    # ------------------------------------------------------------------
-
-    def prepare_obs(self, obs: Any) -> Any:
-        """Add batch dimension (B=1) and move to device."""
-        if isinstance(obs, dict):
-            result: dict = {}
-            for k, v in obs.items():
-                if isinstance(v, np.ndarray):
-                    dtype = torch.long if "edge_index" in k else torch.float32
-                    result[k] = torch.tensor(
-                        v, dtype=dtype, device=self.device
-                    ).unsqueeze(0)
-                elif isinstance(v, torch.Tensor):
-                    result[k] = v.to(self.device).unsqueeze(0)
-                else:
-                    result[k] = v
-            return result
-        return torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+        Config keys:
+        - device: device string (cpu/cuda)
+        """
+        device = cfg.get("device", "cpu")
+        return cls(policy=policy, estimator=estimator, opt_policy=opt_policy, device=device)
 
     # ------------------------------------------------------------------
     # Inference
@@ -180,8 +154,10 @@ class Agent(BaseAgent):
         action_mask: np.ndarray,
         training: bool = True,
     ) -> Tuple[int, float, float]:
+        from core.utils import obs_to_tensor
+
         with torch.no_grad():
-            obs_t = self.prepare_obs(obs)
+            obs_t = obs_to_tensor(obs, device=self.device)
             mask_t = torch.tensor(
                 action_mask, dtype=torch.bool, device=self.device
             ).unsqueeze(0)
@@ -205,20 +181,14 @@ class Agent(BaseAgent):
             scalar loss value.
         """
         if self._estimator is None:
-            raise ValueError("Agent.update() requires an estimator")
+            raise ValueError("PolicyAgent.update() requires an estimator")
         if self._opt_policy is None:
-            raise ValueError("Agent.update() requires opt_policy")
+            raise ValueError("PolicyAgent.update() requires opt_policy")
 
         loss = self._estimator.compute_loss(self._policy, buffer)
         self._opt_policy.zero_grad()
         loss.backward()
         self._opt_policy.step()
-
-        if self._opt_value is not None and self._value_fn is not self._policy:
-            loss_value = self._estimator.compute_loss(self._value_fn, buffer)
-            self._opt_value.zero_grad()
-            loss_value.backward()
-            self._opt_value.step()
 
         return float(loss.item())
 
@@ -247,21 +217,3 @@ class Agent(BaseAgent):
             f"PolicyAgent(network={type(self._policy).__name__}, "
             f"params={n_params:,}, device={self.device!r})"
         )
-
-
-# ---------------------------------------------------------------------------
-# Module-level helpers  (used by trainers)
-# ---------------------------------------------------------------------------
-
-
-def _obs_to_tensor(obs: Any, device: str) -> Any:
-    """Convert a single obs dict to a B=1 tensor on *device*.  No padding."""
-    if isinstance(obs, dict):
-        result: dict = {}
-        for k, v in obs.items():
-            if not isinstance(v, np.ndarray):
-                continue
-            t = torch.from_numpy(v[None]).to(device)
-            result[k] = t.long() if "edge_index" in k else t.float()
-        return result
-    return torch.from_numpy(obs[None]).float().to(device)

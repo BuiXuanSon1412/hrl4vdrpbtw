@@ -14,7 +14,6 @@
     "DEMAND_RANGE_BACKHAUL": [-30, -1],
     "DEMAND_RANGE_LINEHAUL": [1, 30],
     "TIME_WINDOW_SCALING_FACTOR": 1.5,
-    "T_MAX_SYSTEM_H": 24.0,
     "FLEET_SIZES": {
         "10": 2,
         "20": 3,

@@ -3,14 +3,14 @@ core/trainer.py
 ---------------
 Training-loop implementations.
 
-Trainer — single-environment trainer (algorithm-agnostic via estimator)
 MetaTrainer — multi-task MAML with curriculum expansion
+POMOTrainer — Policy Optimization with Multiple Optima
 
 Design principle:
   - Agent holds the policy network and estimator
   - Estimator computes gradients (PPO, A2C, etc.) — algorithm lives here
-  - Trainer is algorithm-agnostic: collect → compute_loss → backward → step
-  - MetaTrainer extends this with inner-loop adaptation and outer meta-updates
+  - MetaTrainer coordinates multi-task learning with inner-loop adaptation and outer meta-updates
+  - POMOTrainer optimizes over multiple starting points per instance
   - TaskManager, CurriculumScheduler used by MetaTrainer only
   - FineTuner adapts trained meta-policy to individual tasks
 """
@@ -18,6 +18,7 @@ Design principle:
 from __future__ import annotations
 
 import time
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -26,316 +27,51 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from core.agent import Agent
+from core.agent import BaseAgent
 from core.buffer import RolloutBuffer
-from core.task import TaskManager
+from core.task import SimpleTask, TaskManager
 
 
 # ---------------------------------------------------------------------------
-# Standalone collect function
+# BaseTrainer (abstract interface)
 # ---------------------------------------------------------------------------
 
 
-def collect(
-    env: Any,
-    policy: Agent,
-    buffer: RolloutBuffer,
-    instance_gen: Callable,
-) -> int:
-    """
-    Collect rollout data into buffer.
+class BaseTrainer(ABC):
+    """Abstract base class for training strategies."""
 
-    Args:
-        env: environment with reset/step interface
-        policy: agent for select_action
-        buffer: rollout buffer to fill
-        instance_gen: callable that generates raw problem instances
-
-    Returns:
-        number of steps collected
-    """
-    rollout_len = buffer.capacity
-
-    def _fresh_episode() -> Tuple[Any, np.ndarray]:
-        for _ in range(100):
-            raw = instance_gen()
-            obs, info = env.reset(raw)
-            mask = info["action_mask"]
-            if mask.any():
-                return obs, mask
-        raise RuntimeError("collect: 100 consecutive dead-start instances.")
-
-    obs, action_mask = _fresh_episode()
-    steps_collected = 0
-
-    while buffer._ptr < rollout_len and not buffer.is_full:
-        action, lp, val = policy.select_action(obs, action_mask, training=True)
-
-        if not action_mask[action]:
-            feasible = np.where(action_mask)[0]
-            if len(feasible) > 0:
-                action = int(np.random.choice(feasible))
-                lp = 0.0
-            else:
-                obs, action_mask = _fresh_episode()
-                continue
-
-        next_obs, reward, terminated, truncated, info = env.step(action)
-
-        buffer.add(
-            obs=obs,
-            action=action,
-            reward=reward,
-            done=(terminated or truncated),
-            log_prob=lp,
-            value=val,
-            action_mask=action_mask,
-        )
-        steps_collected += 1
-
-        obs = next_obs
-        action_mask = info["action_mask"]
-
-        if terminated or truncated or not action_mask.any():
-            obs, action_mask = _fresh_episode()
-
-    return steps_collected
-
-
-# ---------------------------------------------------------------------------
-# Trainer: single-environment training (no meta-learning)
-# ---------------------------------------------------------------------------
-
-
-class Trainer:
-    """
-    Simple single-environment trainer.
-
-    Trains a single policy on one environment without meta-learning.
-    Simpler than MetaTrainer: collect → update → repeat.
-
-    The estimator (injected via agent) determines the gradient algorithm
-    (PPO, A2C, etc.) — this trainer is algorithm-agnostic.
-    """
-
-    def __init__(
-        self,
-        agent: Agent,
-        env: Any,
-        generator: Callable,
-        cfg: Dict[str, Any],
-        evaluator: Any,
-        logger: Any,
-    ):
-        self.agent = agent
-        self.env = env
-        self.generator = generator
-        self.cfg = cfg
-        self.evaluator = evaluator
-        self.logger = logger
-
-        # Extract experiment name and device from hierarchical structure
-        self.experiment_name = cfg.get("name") or cfg.get("experiment", {}).get(
-            "name", "experiment"
-        )
-        self.device = cfg.get("device", "cpu")
-
-        # Extract training config (algorithm is determined by the estimator)
-        training_cfg = cfg.get("training", cfg.get("train", {}))
-
-        # Build training config dict
-        train_logging = training_cfg.get("logging", {})
-        early_stop = training_cfg.get("early_stopping", {})
-
-        self.tcfg = {
-            "total_timesteps": training_cfg.get(
-                "total_timesteps", cfg.get("train", {}).get("total_timesteps", 1000000)
-            ),
-            "rollout_len": training_cfg.get(
-                "rollout_length", cfg.get("train", {}).get("rollout_len", 256)
-            ),
-            "log_interval": train_logging.get(
-                "log_interval", cfg.get("train", {}).get("log_interval", 5)
-            ),
-            "eval_interval": train_logging.get(
-                "eval_interval", cfg.get("train", {}).get("eval_interval", 20)
-            ),
-            "checkpoint_interval": train_logging.get(
-                "checkpoint_interval",
-                cfg.get("train", {}).get("checkpoint_interval", 100),
-            ),
-            "checkpoint_dir": train_logging.get(
-                "checkpoint_dir",
-                cfg.get("train", {}).get("checkpoint_dir", "checkpoints"),
-            ),
-            "log_dir": train_logging.get(
-                "log_dir", cfg.get("train", {}).get("log_dir", "logs")
-            ),
-            "patience": early_stop.get(
-                "patience", cfg.get("train", {}).get("patience", 150)
-            ),
-            "min_delta": early_stop.get(
-                "min_delta", cfg.get("train", {}).get("min_delta", 0.0001)
-            ),
-        }
-
-        # Training state
-        self._timestep = 0
-        self._iteration = 0
-        self._best_objective = float("-inf")
-        self._patience_counter = 0
-
-        # Create optimizer if agent doesn't have one
-        if agent._opt_policy is None:
-            learning_rate = cfg.get("learning_rate", 0.001)
-            self._optimizer = optim.Adam(agent.policy.parameters(), lr=learning_rate)
-            agent._opt_policy = self._optimizer
-        else:
-            assert agent.opt_policy is not None
-            self._optimizer = agent.opt_policy
-
+    @abstractmethod
     def train(self) -> Dict[str, Any]:
         """Run training loop and return summary."""
-        self._print_header()
-        start_time = time.time()
-        stop_reason = "timestep_limit"
+        ...
 
-        while self._timestep < self.tcfg["total_timesteps"]:
-            iter_start = time.time()
-            self._iteration += 1
+    @classmethod
+    @abstractmethod
+    def from_config(
+        cls,
+        cfg: Dict[str, Any],
+        agent: BaseAgent,
+        env: Any,
+        tasks: Dict[str, Tuple[Any, Callable]],
+        evaluator: Any,
+        logger: Any,
+    ) -> "BaseTrainer":
+        """Factory method: instantiate trainer from config.
 
-            metrics = self._update()
-            self._timestep += int(metrics.pop("_steps", 0))
-
-            metrics["iter_time_s"] = time.time() - iter_start
-
-            if self._iteration % self.tcfg["log_interval"] == 0:
-                self.logger.log_metrics(
-                    metrics,
-                    step=self._timestep,
-                    print_keys=["train/loss", "train/value"],
-                )
-
-            if self._iteration % self.tcfg["eval_interval"] == 0:
-                eval_stats = self.evaluator.evaluate(self.generator)
-                self.logger.log_metrics(eval_stats, step=self._timestep, prefix="eval")
-
-                mean_obj = eval_stats.get("mean_objective", float("-inf"))
-                if mean_obj > self._best_objective + self.tcfg["min_delta"]:
-                    self._best_objective = mean_obj
-                    self._patience_counter = 0
-                    self._save_checkpoint("best")
-                    self.logger.log_event(
-                        "best_checkpoint", self._timestep, objective=f"{mean_obj:.4f}"
-                    )
-                else:
-                    self._patience_counter += 1
-
-                if self._patience_counter >= self.tcfg["patience"]:
-                    stop_reason = "early_stopping"
-                    self.logger.log_event(
-                        "early_stop", self._timestep, patience=self.tcfg["patience"]
-                    )
-                    break
-
-        summary = {
-            "stop_reason": stop_reason,
-            "total_iterations": self._iteration,
-            "total_timesteps": self._timestep,
-            "best_objective": self._best_objective,
-            "training_time_s": round(time.time() - start_time, 1),
-        }
-        self._save_checkpoint("final")
-        self.logger.log_event("training_complete", self._timestep, **summary)
-        self.logger.close()
-        self._print_footer(summary)
-        return summary
-
-    def _update(self) -> Dict[str, float]:
-        """Collect rollout and perform gradient update."""
-        buffer = RolloutBuffer(capacity=self.tcfg["rollout_len"])
-        steps_collected = collect(self.env, self.agent, buffer, self.generator)
-
-        assert self.agent.estimator is not None, "Estimator required for training"
-        loss = self.agent.estimator.compute_loss(self.agent.policy, buffer)
-
-        self._optimizer.zero_grad()
-        loss.backward()
-        self._optimizer.step()
-
-        metrics = {
-            "train/loss": float(loss.item()),
-            "_steps": steps_collected,
-        }
-
-        return metrics
-
-    def _save_checkpoint(self, tag: str) -> None:
-        path = f"{self.tcfg['checkpoint_dir']}/{self.experiment_name}_{tag}.pt"
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "network_state": self.agent.policy.state_dict(),
-                "iteration": self._iteration,
-            },
-            path,
-        )
-
-    def _print_header(self) -> None:
-        print(
-            f"\n{'=' * 64}\n"
-            f"  Experiment : {self.experiment_name}\n"
-            f"  Algorithm  : Single-Environment Training\n"
-            f"  Budget     : {self.tcfg['total_timesteps']:,} steps\n"
-            f"  Rollout    : {self.tcfg['rollout_len']} steps\n"
-            f"  Device     : {self.device}\n"
-            f"{'=' * 64}"
-        )
-
-    def _print_footer(self, summary: Dict) -> None:
-        print(
-            f"\n{'=' * 64}\n"
-            f"  Done ({summary['stop_reason']})\n"
-            f"  Iterations : {summary['total_iterations']:,}\n"
-            f"  Timesteps  : {summary['total_timesteps']:,}\n"
-            f"  Best Obj   : {summary['best_objective']:.4f}\n"
-            f"  Time       : {summary['training_time_s']:.1f}s\n"
-            f"{'=' * 64}\n"
-        )
+        Args:
+            cfg: config dict
+            agent: agent instance
+            env: environment template (used for step/reset interface)
+            tasks: dict mapping task_id -> (problem, generator)
+            evaluator: evaluator instance
+            logger: logger instance
+        """
+        ...
 
 
 # ---------------------------------------------------------------------------
 # Inner-loop adaptation (inlined from InnerUpdater)
 # ---------------------------------------------------------------------------
-
-
-def _adapt(
-    network: nn.Module,
-    loss_fn: Callable[[nn.Module, Any], torch.Tensor],
-    support_data: Any,
-    inner_optimizer: optim.Optimizer,
-    n_steps: int,
-) -> None:
-    """
-    Adapt network in-place using support data (second-order MAML).
-
-    Computes support loss, backpropagates through adaptation, and performs
-    optimizer step. Inner-loop gradients are tracked (create_graph=True) so
-    that query-loss backprop can flow through the adaptation step.
-
-    Args:
-        network: policy network to adapt (modified in-place)
-        loss_fn: callable (network, support_data) -> scalar loss
-        support_data: support rollout buffer
-        inner_optimizer: SGD optimizer for inner-loop adaptation
-        n_steps: number of gradient steps
-    """
-    for _ in range(n_steps):
-        loss = loss_fn(network, support_data)
-
-        inner_optimizer.zero_grad()
-        loss.backward(create_graph=True)
-        inner_optimizer.step()
 
 
 # ---------------------------------------------------------------------------
@@ -438,7 +174,7 @@ class FineTuner:
     the meta-policy to each task.
     """
 
-    def __init__(self, agent: Agent, task_manager: Any, cfg: Dict[str, Any]):
+    def __init__(self, agent: BaseAgent, task_manager: Any, cfg: Dict[str, Any]):
         self.agent = agent
         self.task_manager = task_manager
         self.cfg = cfg
@@ -474,9 +210,8 @@ class FineTuner:
         total_steps = 0
 
         for _ in range(num_steps):
-            buffer = RolloutBuffer(capacity=256)
-            steps = collect(task_problem, task_agent, buffer, task_gen)
-            total_steps += steps
+            buffer = self._collect_rollout(task_problem, task_agent, task_gen)
+            total_steps += buffer._ptr
 
             if task_agent.estimator is None:
                 continue
@@ -488,6 +223,60 @@ class FineTuner:
             optimizer.step()
 
         return total_steps
+
+    def _collect_rollout(
+        self, env: Any, agent: Any, generator: Callable
+    ) -> RolloutBuffer:
+        """Collect rollout for fine-tuning: generic strategy.
+
+        Collects transitions until buffer is full (256 default).
+        """
+        buffer = RolloutBuffer(capacity=256)
+
+        def _fresh_episode() -> Tuple[Any, np.ndarray]:
+            for _ in range(100):
+                raw = generator()
+                obs, info = env.reset(raw)
+                mask = info["action_mask"]
+                if mask.any():
+                    return obs, mask
+            raise RuntimeError(
+                "FineTuner._collect_rollout: 100 consecutive dead-start instances."
+            )
+
+        obs, action_mask = _fresh_episode()
+
+        while buffer._ptr < buffer.capacity and not buffer.is_full:
+            action, lp, val = agent.select_action(obs, action_mask, training=True)
+
+            if not action_mask[action]:
+                feasible = np.where(action_mask)[0]
+                if len(feasible) > 0:
+                    action = int(np.random.choice(feasible))
+                    lp = 0.0
+                else:
+                    obs, action_mask = _fresh_episode()
+                    continue
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+
+            buffer.add(
+                obs=obs,
+                action=action,
+                reward=reward,
+                done=(terminated or truncated),
+                log_prob=lp,
+                value=val,
+                action_mask=action_mask,
+            )
+
+            obs = next_obs
+            action_mask = info["action_mask"]
+
+            if terminated or truncated or not action_mask.any():
+                obs, action_mask = _fresh_episode()
+
+        return buffer
 
     def get_task_agent(self, task_id: Any) -> Any:
         """Retrieve fine-tuned agent for a task."""
@@ -525,7 +314,7 @@ class FineTuner:
 # ---------------------------------------------------------------------------
 
 
-class MetaTrainer:
+class MetaTrainer(BaseTrainer):
     """
     MAML trainer (second-order) with curriculum learning.
 
@@ -539,7 +328,7 @@ class MetaTrainer:
 
     def __init__(
         self,
-        agent: Agent,
+        agent: BaseAgent,
         task_manager: TaskManager,
         eval_problem: Any,
         eval_gen: Callable,
@@ -553,55 +342,32 @@ class MetaTrainer:
         self.evaluator = evaluator
         self.logger = logger
 
-        # Extract experiment name and device from hierarchical structure
-        self.experiment_name = cfg.get("name") or cfg.get("experiment", {}).get(
-            "name", "experiment"
-        )
+        # Handle experiment name (can be string or dict)
+        experiment = cfg.get("experiment", {})
+        if isinstance(experiment, str):
+            self.experiment_name = cfg.get("name") or experiment or "experiment"
+        else:
+            self.experiment_name = cfg.get("name") or experiment.get("name", "experiment")
         self.device = cfg.get("device", "cpu")
 
-        # Extract config from hierarchical structure
-        algo_cfg = cfg.get("algorithm", cfg.get("maml", {}))
-        if isinstance(algo_cfg, str):
-            algo_cfg = cfg.get("maml", {})
+        # Extract config from trainer structure
+        trainer_cfg = cfg.get("trainer", {})
+        meta_cfg = trainer_cfg.get("meta_learning", {})
         training_cfg = cfg.get("training", cfg.get("train", {}))
 
-        # Build maml config dict from hierarchical structure
-        outer_loop = algo_cfg.get("outer_loop", {})
-        inner_loop = algo_cfg.get("inner_loop", {})
-        data_coll = algo_cfg.get("data_collection", {})
-        curriculum = algo_cfg.get("curriculum", {})
+        # Build meta training config from trainer.meta_learning structure
+        meta_agent_cfg = meta_cfg.get("meta_agent", {})
+        sub_agent_cfg = meta_cfg.get("sub_agent", {})
+        curriculum_cfg = meta_cfg.get("curriculum", {})
 
         self.mcfg = {
-            "meta_lr": outer_loop.get(
-                "meta_learning_rate", cfg.get("maml", {}).get("meta_lr", 0.0003)
-            ),
-            "n_tasks_per_update": outer_loop.get(
-                "n_tasks_per_update", cfg.get("maml", {}).get("n_tasks_per_update", 4)
-            ),
-            "max_grad_norm": outer_loop.get(
-                "max_gradient_norm", cfg.get("maml", {}).get("max_grad_norm", 0.5)
-            ),
-            "inner_lr": inner_loop.get(
-                "adaptation_learning_rate", cfg.get("maml", {}).get("inner_lr", 0.01)
-            ),
-            "n_inner_steps": inner_loop.get(
-                "n_adaptation_steps", cfg.get("maml", {}).get("n_inner_steps", 1)
-            ),
-            "support_rollout_len": data_coll.get(
-                "support_rollout_length",
-                cfg.get("maml", {}).get("support_rollout_len", 256),
-            ),
-            "query_rollout_len": data_coll.get(
-                "query_rollout_length",
-                cfg.get("maml", {}).get("query_rollout_len", 256),
-            ),
-            "entropy_threshold": curriculum.get(
-                "entropy_threshold", cfg.get("maml", {}).get("entropy_threshold", 0.5)
-            ),
-            "curriculum_check_interval": curriculum.get(
-                "check_interval",
-                cfg.get("maml", {}).get("curriculum_check_interval", 1),
-            ),
+            "meta_lr": float(meta_agent_cfg.get("learning_rate", 0.0003)),
+            "max_grad_norm": float(meta_cfg.get("max_grad_norm", 0.5)),
+            "inner_lr": float(sub_agent_cfg.get("learning_rate", 0.01)),
+            "support_rollout_len": int(meta_agent_cfg.get("rollout_length", 256)),
+            "query_rollout_len": int(sub_agent_cfg.get("rollout_length", 256)),
+            "entropy_threshold": float(curriculum_cfg.get("entropy_threshold", 0.5)),
+            "curriculum_check_interval": int(curriculum_cfg.get("check_interval", 1)),
         }
 
         # Build training config dict from hierarchical structure
@@ -659,6 +425,104 @@ class MetaTrainer:
         self._best_objective = float("-inf")
         self._patience_counter = 0
 
+    @classmethod
+    def from_config(
+        cls,
+        cfg: Dict[str, Any],
+        agent: BaseAgent,
+        env: Any,
+        tasks: Dict[str, Tuple[Any, Callable]],
+        evaluator: Any,
+        logger: Any,
+    ) -> "MetaTrainer":
+        if not tasks:
+            raise ValueError("MetaTrainer.from_config requires tasks dict")
+
+        task_list = []
+        for task_id in list(tasks.keys()):
+            problem, gen = tasks[task_id]
+            task = SimpleTask(task_id=task_id, problem=problem, generator=gen)
+            task_list.append(task)
+        task_manager = TaskManager(task_list)
+
+        # Use median task size as eval anchor
+        eval_task_ids = list(tasks.keys())
+        eval_task_id = eval_task_ids[len(eval_task_ids) // 2]
+        eval_problem, eval_gen = tasks[eval_task_id]
+
+        return cls(
+            agent=agent,
+            task_manager=task_manager,
+            eval_problem=eval_problem,
+            eval_gen=eval_gen,
+            cfg=cfg,
+            evaluator=evaluator,
+            logger=logger,
+        )
+
+    def _collect(self, env: Any, agent: Any, generator: Callable) -> RolloutBuffer:
+        """Collect complete episodes into buffer (same strategy as Trainer).
+
+        Collects full episodes from environment up to buffer capacity.
+        Uses support_rollout_len from mcfg as default capacity.
+
+        Args:
+            env: environment with reset/step interface
+            agent: agent for select_action
+            generator: callable that generates raw problem instances
+
+        Returns:
+            RolloutBuffer with collected transitions
+        """
+        capacity = self.mcfg.get("support_rollout_len", 256)
+        buffer = RolloutBuffer(capacity=capacity)
+        rollout_len = buffer.capacity
+
+        def _fresh_episode() -> Tuple[Any, np.ndarray]:
+            for _ in range(100):
+                raw = generator()
+                obs, info = env.reset(raw)
+                mask = info["action_mask"]
+                if mask.any():
+                    return obs, mask
+            raise RuntimeError(
+                "MetaTrainer._collect: 100 consecutive dead-start instances."
+            )
+
+        obs, action_mask = _fresh_episode()
+
+        while buffer._ptr < rollout_len and not buffer.is_full:
+            action, lp, val = agent.select_action(obs, action_mask, training=True)
+
+            if not action_mask[action]:
+                feasible = np.where(action_mask)[0]
+                if len(feasible) > 0:
+                    action = int(np.random.choice(feasible))
+                    lp = 0.0
+                else:
+                    obs, action_mask = _fresh_episode()
+                    continue
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+
+            buffer.add(
+                obs=obs,
+                action=action,
+                reward=reward,
+                done=(terminated or truncated),
+                log_prob=lp,
+                value=val,
+                action_mask=action_mask,
+            )
+
+            obs = next_obs
+            action_mask = info["action_mask"]
+
+            if terminated or truncated or not action_mask.any():
+                obs, action_mask = _fresh_episode()
+
+        return buffer
+
     def train(self) -> Dict[str, Any]:
         """Run meta-training loop and return summary."""
         self._print_header()
@@ -669,7 +533,7 @@ class MetaTrainer:
             iter_start = time.time()
             self._iteration += 1
             print("iteration ", self._iteration)
-            metrics = self._meta_update()
+            metrics = self._update_meta_policy()
             self._timestep += int(metrics.pop("_steps", 0))
 
             metrics["iter_time_s"] = time.time() - iter_start
@@ -722,7 +586,27 @@ class MetaTrainer:
         self._print_footer(summary)
         return summary
 
-    def _meta_update(self) -> Dict[str, float]:
+    def _update_sub_policy(
+        self,
+        network: nn.Module,
+        loss_fn: Callable[[nn.Module, Any], torch.Tensor],
+        support_data: Any,
+        inner_optimizer: optim.Optimizer,
+        n_steps: int,
+    ) -> None:
+        """Adapt network in-place using support data (second-order MAML).
+
+        Computes support loss, backpropagates through adaptation, and performs
+        optimizer step. Inner-loop gradients are tracked (create_graph=True) so
+        that query-loss backprop can flow through the adaptation step.
+        """
+        for _ in range(n_steps):
+            loss = loss_fn(network, support_data)
+            inner_optimizer.zero_grad()
+            loss.backward(create_graph=True)
+            inner_optimizer.step()
+
+    def _update_meta_policy(self) -> Dict[str, float]:
         """
         Execute one MAML meta-update with second-order meta-gradients.
 
@@ -748,16 +632,17 @@ class MetaTrainer:
         for task_id in active_task_ids:
             task = self.task_manager.get_task(task_id)
 
-            # Support data (inner-loop training)
-            sup_buf = RolloutBuffer(capacity=self.mcfg["support_rollout_len"])
-            print("start collect: ...")
-            collect(task.problem, self.agent, sup_buf, task.generator)
-            print("finish collect !")
+            # Support data (inner-loop training) — temporarily override buffer capacity
+            _orig_support_len = self.tcfg.get("rollout_len", 256)
+            self.tcfg["rollout_len"] = self.mcfg["support_rollout_len"]
+            sup_buf = self._collect(task.problem, self.agent, task.generator)
+            self.tcfg["rollout_len"] = _orig_support_len
             total_steps += sup_buf._ptr
 
-            # Query data (meta-gradient computation)
-            qry_buf = RolloutBuffer(capacity=self.mcfg["query_rollout_len"])
-            collect(task.problem, self.agent, qry_buf, task.generator)
+            # Query data (meta-gradient computation) — temporarily override buffer capacity
+            self.tcfg["rollout_len"] = self.mcfg["query_rollout_len"]
+            qry_buf = self._collect(task.problem, self.agent, task.generator)
+            self.tcfg["rollout_len"] = _orig_support_len
             total_steps += qry_buf._ptr
 
             task_trajectories[task_id] = (sup_buf, qry_buf)
@@ -798,12 +683,12 @@ class MetaTrainer:
             )
 
             # Adapt fast-weights via gradient descent on support loss
-            _adapt(
+            self._update_sub_policy(
                 network=sub_agent.policy,
                 loss_fn=lambda net, data: estimator.compute_loss(net, data),
                 support_data=sup_buf,
                 inner_optimizer=inner_optimizer,
-                n_steps=self.mcfg["n_inner_steps"],
+                n_steps=1,
             )
 
             # Outer loop: compute query loss with adapted task-specific policy
@@ -892,12 +777,10 @@ class MetaTrainer:
         print(
             f"\n{'=' * 64}\n"
             f"  Experiment : {self.experiment_name}\n"
-            f"  Algorithm  : MAML (Phase 1: Meta-Learning)\n"
+            f"  Algorithm  : MAML (Meta-Learning)\n"
             f"  Tasks      : {task_ids} (of {total_tasks} total)\n"
             f"  Inner lr   : {self.mcfg['inner_lr']}   "
             f"Meta lr : {self.mcfg['meta_lr']}\n"
-            f"  Inner steps: {self.mcfg['n_inner_steps']}   "
-            f"Tasks/update: {self.mcfg['n_tasks_per_update']}\n"
             f"  Budget     : {self.tcfg['total_timesteps']:,} steps\n"
             f"  Device     : {self.device}\n"
             f"{'=' * 64}"
@@ -920,99 +803,63 @@ class MetaTrainer:
 # ---------------------------------------------------------------------------
 
 
-def _collect_episode_from_state(
-    env: Any,
-    policy: Agent,
-    state: Any,
-    obs: Any,
-    action_mask: np.ndarray,
-) -> Tuple[float, List[Tuple[Any, int, np.ndarray]]]:
-    """
-    Collect a single episode from a given starting state.
-
-    Args:
-        env: environment
-        policy: policy agent
-        state: starting state (internal)
-        obs: observation at this state
-        action_mask: feasible actions at this state
-
-    Returns:
-        (episode_return, list of (obs, action, mask) tuples for gradient recomputation)
-    """
-    trajectory = []
-    cumulative_reward = 0.0
-
-    while True:
-        action, _, _ = policy.select_action(obs, action_mask, training=True)
-
-        if not action_mask[action]:
-            feasible = np.where(action_mask)[0]
-            if len(feasible) > 0:
-                action = int(np.random.choice(feasible))
-            else:
-                break
-
-        next_obs, reward, terminated, truncated, info = env.step(action)
-        cumulative_reward += reward
-        trajectory.append((obs, action, action_mask.copy()))
-
-        if terminated or truncated or not info["action_mask"].any():
-            break
-
-        obs = next_obs
-        action_mask = info["action_mask"]
-
-    return cumulative_reward, trajectory
-
-
-class POMOTrainer:
+class POMOTrainer(BaseTrainer):
     """
     POMO trainer: policy optimization with multiple optima.
 
-    For each training instance:
-      1. Get candidate starting states from env.get_candidate_starts()
-      2. Roll out N independent episodes using the same policy
-      3. Compute REINFORCE loss with baseline = mean reward across all starts
-      4. Advantage for each trajectory: A_i = R_i - baseline
-      5. Loss = -1/N * sum_i(A_i * sum(log_prob_ij))
-      6. Update policy
-
+    Collects complete episodes from multiple candidate starting points for each instance,
+    then uses REINFORCEEstimator to compute policy gradients with a baseline.
     This encourages the policy to find good solutions regardless of starting point.
+
+    Collection strategy (POMO):
+      - For each instance: get candidate starting states via env.get_candidate_starts()
+      - Roll out complete episode from each candidate
+      - Accumulate all transitions into a RolloutBuffer
+
+    Loss computation (delegated to REINFORCEEstimator):
+      - Compute returns and advantage = return - baseline
+      - Loss = -log_prob * advantage
     """
 
     def __init__(
         self,
-        agent: Agent,
+        agent: BaseAgent,
         env: Any,
-        generator: Callable,
+        tasks: Dict[str, Tuple[Any, Callable]],
         cfg: Dict[str, Any],
         evaluator: Any,
         logger: Any,
     ):
         self.agent = agent
         self.env = env
-        self.generator = generator
+        self.tasks = tasks
         self.cfg = cfg
         self.evaluator = evaluator
         self.logger = logger
 
-        self.experiment_name = cfg.get("name") or cfg.get("experiment", {}).get(
-            "name", "pomo_experiment"
-        )
+        # Handle experiment name (can be string or dict)
+        experiment = cfg.get("experiment", {})
+        if isinstance(experiment, str):
+            self.experiment_name = cfg.get("name") or experiment or "pomo_experiment"
+        else:
+            self.experiment_name = cfg.get("name") or experiment.get("name", "pomo_experiment")
         self.device = cfg.get("device", "cpu")
 
-        pomo_cfg = cfg.get("pomo", {})
-        training_cfg = cfg.get("training", cfg.get("train", {}))
+        # Extract generator from first task in pool
+        if not tasks:
+            raise ValueError("POMOTrainer requires at least one task")
+        first_task_id = list(tasks.keys())[0]
+        _, self.generator = tasks[first_task_id]
+
+        # Extract config from hierarchical structure
+        trainer_cfg = cfg.get("trainer", {})
+        agent_cfg = trainer_cfg.get("agent", {})
+        hparams_cfg = trainer_cfg.get("hparams", {})
+        training_cfg = trainer_cfg.get("training", cfg.get("training", cfg.get("train", {})))
 
         self.pcfg = {
-            "n_instances_per_update": pomo_cfg.get(
-                "n_instances_per_update",
-                cfg.get("train", {}).get("n_instances_per_update", 4),
-            ),
-            "entropy_coef": pomo_cfg.get("entropy_coef", 0.01),
-            "learning_rate": cfg.get("learning_rate", 0.001),
-            "max_grad_norm": pomo_cfg.get("max_grad_norm", 0.5),
+            "learning_rate": float(agent_cfg.get("learning_rate", 0.001)),
+            "max_grad_norm": float(hparams_cfg.get("max_grad_norm", 0.5)),
         }
 
         train_logging = training_cfg.get("logging", {})
@@ -1055,13 +902,34 @@ class POMOTrainer:
         else:
             opt = agent.opt_policy
             if opt is None:
-                raise ValueError("POMOTrainer requires an optimizer. Agent must have opt_policy or allow creation.")
+                raise ValueError(
+                    "POMOTrainer requires an optimizer. Agent must have opt_policy or allow creation."
+                )
             self._optimizer = opt
 
         self._timestep = 0
         self._iteration = 0
         self._best_objective = float("-inf")
         self._patience_counter = 0
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: Dict[str, Any],
+        agent: BaseAgent,
+        env: Any,
+        tasks: Dict[str, Tuple[Any, Callable]],
+        evaluator: Any,
+        logger: Any,
+    ) -> "POMOTrainer":
+        return cls(
+            agent=agent,
+            env=env,
+            tasks=tasks,
+            cfg=cfg,
+            evaluator=evaluator,
+            logger=logger,
+        )
 
     def train(self) -> Dict[str, Any]:
         """Run POMO training loop and return summary."""
@@ -1073,7 +941,7 @@ class POMOTrainer:
             iter_start = time.time()
             self._iteration += 1
 
-            metrics = self._pomo_update()
+            metrics = self._update_policy()
             self._timestep += int(metrics.pop("_steps", 0))
 
             metrics["iter_time_s"] = time.time() - iter_start
@@ -1120,20 +988,22 @@ class POMOTrainer:
         self._print_footer(summary)
         return summary
 
-    def _pomo_update(self) -> Dict[str, float]:
+    def _update_policy(self) -> Dict[str, float]:
         """
-        Perform one POMO update.
+        Perform one POMO update using REINFORCEEstimator.
 
-        For each of n_instances_per_update problem instances:
-          1. Encode instance
+        For a single problem instance:
+          1. Generate instance and reset environment
           2. Get candidate starts via env.get_candidate_starts()
-          3. Roll out N episodes from each start
-          4. Compute REINFORCE loss with advantage = R_i - mean(R_j)
+          3. Collect complete episodes from each candidate directly into buffer
+          4. Track episode returns for logging
+          5. Compute loss via estimator.compute_loss()
+          6. Backprop and step optimizer
         """
-        n_instances = self.pcfg["n_instances_per_update"]
+        n_instances = 1
+        buffer = RolloutBuffer(capacity=self.tcfg.get("rollout_len", 2048))
         total_steps = 0
-        batch_loss = None
-        all_returns = []
+        episode_returns = []
 
         for _ in range(n_instances):
             for attempt in range(100):
@@ -1152,105 +1022,78 @@ class POMOTrainer:
             if not candidates:
                 continue
 
-            episode_returns = []
-            episode_trajectories = []
-
             for state, start_obs, start_info in candidates:
+                if buffer.is_full:
+                    break
+
                 self.env._current_state = state
-                ret, trajectory = _collect_episode_from_state(
-                    self.env,
-                    self.agent,
-                    state,
-                    start_obs,
-                    start_info["action_mask"],
-                )
-                episode_returns.append(ret)
-                episode_trajectories.append(trajectory)
-                total_steps += len(trajectory)
+                traj_obs = start_obs
+                traj_mask = start_info["action_mask"]
+                episode_return = 0.0
 
-            baseline = float(np.mean(episode_returns))
-            loss = self._compute_pomo_loss(
-                episode_returns, episode_trajectories, baseline
-            )
+                while not buffer.is_full:
+                    action, lp, val = self.agent.select_action(
+                        traj_obs, traj_mask, training=True
+                    )
 
-            if batch_loss is None:
-                batch_loss = loss / n_instances
-            else:
-                batch_loss = batch_loss + loss / n_instances
+                    if not traj_mask[action]:
+                        feasible = np.where(traj_mask)[0]
+                        if len(feasible) > 0:
+                            action = int(np.random.choice(feasible))
+                            lp = 0.0
+                        else:
+                            break
 
-            all_returns.extend(episode_returns)
+                    next_obs, reward, terminated, truncated, info = self.env.step(
+                        action
+                    )
+                    episode_return += reward
 
-        if total_steps == 0 or batch_loss is None:
+                    buffer.add(
+                        obs=traj_obs,
+                        action=action,
+                        reward=reward,
+                        done=(terminated or truncated),
+                        log_prob=lp,
+                        value=val,
+                        action_mask=traj_mask,
+                    )
+
+                    total_steps += 1
+
+                    if terminated or truncated or not info["action_mask"].any():
+                        episode_returns.append(episode_return)
+                        break
+
+                    traj_obs = next_obs
+                    traj_mask = info["action_mask"]
+
+            if buffer.is_full:
+                break
+
+        if total_steps == 0 or buffer._ptr == 0:
             return {
                 "train/pomo_loss": 0.0,
                 "train/avg_episode_return": 0.0,
                 "_steps": 0,
             }
 
+        loss = self.agent.estimator.compute_loss(self.agent.policy, buffer)
+
         self._optimizer.zero_grad()
-        batch_loss.backward()
+        loss.backward()
         nn.utils.clip_grad_norm_(
             self.agent.policy.parameters(), self.pcfg["max_grad_norm"]
         )
         self._optimizer.step()
 
+        avg_return = float(np.mean(episode_returns)) if episode_returns else 0.0
+
         return {
-            "train/pomo_loss": float(batch_loss.item()),
-            "train/avg_episode_return": float(np.mean(all_returns))
-            if all_returns
-            else 0.0,
+            "train/pomo_loss": float(loss.item()),
+            "train/avg_episode_return": avg_return,
             "_steps": total_steps,
         }
-
-    def _compute_pomo_loss(
-        self,
-        episode_returns: List[float],
-        episode_trajectories: List[List[Tuple]],
-        baseline: float,
-    ) -> torch.Tensor:
-        """
-        Compute POMO loss: -1/N * sum_i(A_i * sum(log_prob_ij))
-
-        Recomputes log probs via forward pass to maintain gradient flow.
-
-        Args:
-            episode_returns: R_i for each trajectory i
-            episode_trajectories: list of trajectory lists. Each trajectory is list of (obs, action, mask)
-            baseline: mean return across all trajectories
-
-        Returns:
-            scalar loss tensor for backpropagation
-        """
-        loss = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-        n_episodes = len(episode_returns)
-
-        for ret, trajectory in zip(episode_returns, episode_trajectories):
-            if not trajectory:
-                continue
-
-            advantage = float(ret - baseline)
-            trajectory_log_prob = torch.tensor(
-                0.0, dtype=torch.float32, device=self.device
-            )
-
-            for obs, action, mask in trajectory:
-                obs_t = self.agent.prepare_obs(obs)
-                mask_t = torch.tensor(
-                    mask, dtype=torch.bool, device=self.device
-                ).unsqueeze(0)
-                action_t = torch.tensor(
-                    action, dtype=torch.long, device=self.device
-                ).unsqueeze(0)
-
-                _, lp_t, _ = self.agent.policy.get_action_and_log_prob(
-                    obs_t, mask_t, deterministic=False
-                )
-
-                trajectory_log_prob = trajectory_log_prob + lp_t.squeeze(0)
-
-            loss = loss + advantage * trajectory_log_prob / n_episodes
-
-        return -loss
 
     def _save_checkpoint(self, tag: str) -> None:
         path = f"{self.tcfg['checkpoint_dir']}/{self.experiment_name}_{tag}.pt"
@@ -1269,7 +1112,6 @@ class POMOTrainer:
             f"  Experiment : {self.experiment_name}\n"
             f"  Algorithm  : POMO (Multiple Optima)\n"
             f"  Budget     : {self.tcfg['total_timesteps']:,} steps\n"
-            f"  Instances  : {self.pcfg['n_instances_per_update']} per update\n"
             f"  Device     : {self.device}\n"
             f"{'=' * 64}"
         )

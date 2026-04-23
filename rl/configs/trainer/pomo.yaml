@@ -1,0 +1,24 @@
+# trainer/pomo.yaml
+# POMO (Policy Optimization with Multiple Optima) training configuration
+#
+# POMO improves policy learning for combinatorial optimization by:
+# - Starting from multiple candidate initial states per instance
+# - Collecting N parallel rollouts from different starting points
+# - Using REINFORCE with shared baseline (advantage = reward - mean_reward)
+# - Provides richer gradient signal and policy invariance
+trainer:
+  name: pomo
+
+  agent:
+    name: policy
+    learning_rate: 0.001
+    estimator: reinforce
+    optimizer: adam
+    rollout_length: None
+
+  hparams:
+    max_grad_norm: 0.5
+
+  evaluation:
+    eval_interval: 100
+    n_eval_episodes: 20
