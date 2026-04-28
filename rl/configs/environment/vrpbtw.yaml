@@ -33,15 +33,15 @@ environment:
     # Available tasks for training/evaluation
     # Format: {difficulty:003d}_N{customers}_F{fleets}_{distribution}
     tasks:
-      - 001_N10_F2_RC
+      #- 001_N10_F2_RC
       - 002_N10_F2_R
-      - 003_N10_F2_C
-      - 004_N20_F3_RC
-      - 005_N20_F3_R
-      - 006_N20_F3_C
-      - 007_N50_F5_RC
-      - 008_N50_F5_R
-      - 009_N50_F5_C
-      - 010_N100_F10_RC
-      - 011_N100_F10_R
-      - 012_N100_F10_C
+      #- 003_N10_F2_C
+      #- 004_N20_F3_RC
+      #- 005_N20_F3_R
+      #- 006_N20_F3_C
+      #- 007_N50_F5_RC
+      #- 008_N50_F5_R
+      #- 009_N50_F5_C
+      #- 010_N100_F10_RC
+      #- 011_N100_F10_R
+      #- 012_N100_F10_C

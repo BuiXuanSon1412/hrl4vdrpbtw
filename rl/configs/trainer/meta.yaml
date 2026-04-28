@@ -10,30 +10,72 @@
 trainer:
   name: meta
 
-  meta_learning:
-    meta_agent:
-      name: policy
-      learning_rate: 0.001
-      optimizer: adam
-      rollout_length: 256
-  
-    sub_agent:
-      name: policy
-      learning_rate: 0.001
-      optimizer: adam
-      rollout_length: 256
-  
-    curriculum:
+  phase:
+    meta_learning:
       enabled: true
-      metric: entropy
+      
+      discount_factor: 0.99
+      
+      agents:
+        meta_agent:
+          name: policy
+          learning_rate: 0.001
+          optimizer: unspecified
+          rollout_length: 256
+          max_grad_norm: 0.5
+        sub_agent:
+          name: policy
+          learning_rate: 0.001
+          optimizer: adam
+          rollout_length: 256
+          max_grad_norm: 0.5
+      
+      curriculum:
+        enabled: true
+        metric: entropy
+      
+      control:
+        total_timesteps: 2000000
+        logging:
+          log_interval: 5
+          eval_interval: 20
+          checkpoint_interval: 100
+        early_stopping:
+          patience: 150
+          min_delta: 0.0001
+        evaluation:
+          deterministic: true
+          n_episodes: 20
+          decoding:
+            beam_width: 1
 
-  fine_tuning:
-    sub_agent:
-      name: policy
-      learning_rate: 0.001
-      optimizer: adam
-      rollout_length: 256
 
-  evaluation:
-    eval_interval: 100
-    n_eval_episodes: 20
+
+    fine_tuning:
+      enabled: true
+      
+      discount_factor: 0.99
+      
+      agents:
+        agent:
+          name: policy
+          learning_rate: 0.001
+          optimizer: adam
+          rollout_length: 256
+          max_grad_norm: 0.5
+
+      control:
+        total_timesteps: 2000000
+        logging:
+          log_interval: 5
+          eval_interval: 20
+          checkpoint_interval: 100
+        early_stopping:
+          patience: 150
+          min_delta: 0.0001
+        evaluation:
+          deterministic: true
+          n_episodes: 20
+          decoding:
+            beam_width: 1
+

@@ -26,6 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from globals import DEVICE
 from core.agent import BaseAgent
 from core.environment import Environment, Solution, SolutionPool
 from core.utils import obs_to_tensor
@@ -67,26 +68,22 @@ class Evaluator:
 
     def evaluate(
         self,
-        instance_generator: Callable[..., Any],
-        size: Optional[int] = None,
+        task_id: Optional[str] = None,
     ) -> Dict[str, float]:
         objectives: List[float] = []
         rewards: List[float] = []
         times: List[float] = []
         solutions: List[Any] = []
 
-        gen = (lambda: instance_generator(size=size)) if size else instance_generator
-
         for _ in range(self.n_episodes):
-            raw = gen()
             t0 = time.time()
 
             if self.beam_width > 1:
-                sol = self._beam_search(raw)
+                sol = self._beam_search(task_id)
             elif self.n_samples > 1:
-                sol = self._sampling_decode(raw, self.n_samples)
+                sol = self._sampling_decode(task_id, n_samples=self.n_samples)
             else:
-                sol = self._greedy_decode(raw)
+                sol = self._greedy_decode(task_id)
 
             times.append(time.time() - t0)
             objectives.append(sol.objective)
@@ -104,6 +101,30 @@ class Evaluator:
             "n_episodes": float(self.n_episodes),
         }
 
+        # Extract cost and service_rate metrics from solutions
+        costs: List[float] = []
+        service_rates: List[float] = []
+
+        for sol in solutions:
+            if "total_cost" in sol.metadata:
+                costs.append(float(sol.metadata["total_cost"]))
+
+            if "served_count" in sol.metadata and "n_customers" in sol.metadata:
+                served = sol.metadata["served_count"]
+                total = sol.metadata["n_customers"]
+                if total > 0:
+                    service_rates.append(float(served / total))
+
+        if costs:
+            stats["mean_cost"] = float(np.mean(costs))
+            stats["std_cost"] = float(np.std(costs))
+            stats["best_cost"] = float(np.min(costs))
+
+        if service_rates:
+            stats["mean_service_rate"] = float(np.mean(service_rates))
+            stats["std_service_rate"] = float(np.std(service_rates))
+            stats["best_service_rate"] = float(np.max(service_rates))
+
         # Solution quality breakdown
         sol_stats = self.evaluate_solutions(solutions)
         stats.update({f"solution_{k}": v for k, v in sol_stats.items()})
@@ -114,8 +135,9 @@ class Evaluator:
     # Decoding strategies
     # ------------------------------------------------------------------
 
-    def _greedy_decode(self, raw_instance: Any) -> Solution:
-        obs, info = self.env.reset(raw_instance)
+    def _greedy_decode(self, task_id: Any) -> Solution:
+        self.env.retask(task_id)
+        obs, info = self.env.reset()
         mask = info["action_mask"]
         ep_reward = 0.0
         actions: List[int] = []
@@ -147,17 +169,18 @@ class Evaluator:
         sol.metadata["episode_reward"] = ep_reward
         return sol
 
-    def _sampling_decode(self, raw_instance: Any, n: int) -> Solution:
+    def _sampling_decode(self, task_id: Any, n_samples: int) -> Solution:
         pool = SolutionPool(capacity=1)
-        for _ in range(n):
-            pool.add(self._greedy_decode(raw_instance))
+        for _ in range(n_samples):
+            pool.add(self._greedy_decode(task_id))
         assert pool.best is not None
         return pool.best
 
-    def _beam_search(self, raw_instance: Any) -> Solution:
+    def _beam_search(self, task_id: Any) -> Solution:
         """Beam search over partial solution states."""
         env = self.env
-        obs, info = env.reset(raw_instance)
+        env.retask(task_id)
+        obs, info = env.reset()
         initial_state = env._current_state
 
         # (neg_log_prob, state, action_sequence)
@@ -194,7 +217,7 @@ class Evaluator:
             ]
 
         if not completed:
-            return self._greedy_decode(raw_instance)
+            return self._greedy_decode(task_id)
 
         best = max(
             completed,
@@ -213,17 +236,16 @@ class Evaluator:
             lp[mask] = 0.0
             return lp
 
-        device = next(network.parameters()).device
-        obs_t = obs_to_tensor(obs, str(device))
+        obs_t = obs_to_tensor(obs, DEVICE)
         if isinstance(obs_t, dict):
             obs_t = {
-                k: (v.to(device) if isinstance(v, torch.Tensor) else v)
+                k: (v.to(DEVICE) if isinstance(v, torch.Tensor) else v)
                 for k, v in obs_t.items()
             }
         else:
-            obs_t = obs_t.to(device)
+            obs_t = obs_t.to(DEVICE)
 
-        mask_t = torch.tensor(mask[np.newaxis], dtype=torch.bool, device=device)
+        mask_t = torch.tensor(mask[np.newaxis], dtype=torch.bool, device=DEVICE)
 
         with torch.no_grad():
             logits, _ = network.forward(obs_t, mask_t)

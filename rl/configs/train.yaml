@@ -10,14 +10,20 @@ device: cpu
 
 reproducibility:
   seed:
-    global_seed: 42
-    torch_seed: 42
+    random_seed: 42
     numpy_seed: 42
+    torch_seed: 42
 
-experiment: train
+experiment:
+  name: 001_pomo
+  description: initial experiment
+  
+logger:
+  base_dir: experiment/train
+  verbose: true
+  tensorboard: false
 
 _include:
   - trainer: trainer/pomo.yaml
   - policy: policy/hgnn.yaml
   - environment: environment/vrpbtw.yaml
-  - estimator: estimator/reinforce.yaml

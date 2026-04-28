@@ -54,7 +54,7 @@ def load_config(path: str) -> Dict[str, Any]:
         _include:
           - trainer: configs/trainer/pomo.yaml
           - policy: configs/policy/hgnn.yaml
-          - estimator: configs/estimator/ppo.yaml
+          - environment: configs/environment/vrpbtw.yaml
 
     Included configs are merged in order, then main config merged on top.
 

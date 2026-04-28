@@ -18,6 +18,8 @@ from typing import Any, Optional, Union
 import torch
 import numpy as np
 
+from globals import DEVICE
+
 
 # ---------------------------------------------------------------------------
 # RunningNormalizer
@@ -104,62 +106,47 @@ def _derive_seed(base: int, tag: str) -> int:
 
 class SeedManager:
     """
-    Manages all sources of randomness for a single experiment.
+    Manages randomness for a single experiment via library-specific seeds.
 
-    Calling seed_everything() seeds Python, NumPy, and PyTorch from
-    global_seed.  Child RNGs for the environment and data pipeline are
-    derived deterministically so they are independent yet reproducible.
+    Calling seed_everything() seeds Python, NumPy, and PyTorch with
+    independent seeds, allowing fine-grained control over each library's RNG.
 
     Parameters
     ----------
-    global_seed : Master seed.
-    env_seed    : Override for the environment RNG (None → derived).
-    data_seed   : Override for the data/instance RNG (None → derived).
+    random_seed : Seed for Python's random module.
+    numpy_seed  : Seed for NumPy's RNG.
+    torch_seed  : Seed for PyTorch.
     """
 
     def __init__(
         self,
-        global_seed: int = 42,
-        env_seed: Optional[int] = None,
-        data_seed: Optional[int] = None,
+        random_seed: int = 42,
+        numpy_seed: int = 42,
+        torch_seed: int = 42,
     ):
-        self.global_seed = global_seed
-        self.env_seed = (
-            env_seed if env_seed is not None else _derive_seed(global_seed, "env")
-        )
-        self.data_seed = (
-            data_seed if data_seed is not None else _derive_seed(global_seed, "data")
-        )
+        self.random_seed = random_seed
+        self.numpy_seed = numpy_seed
+        self.torch_seed = torch_seed
 
     def seed_everything(self) -> None:
-        """Seed Python, NumPy, and PyTorch (if available)."""
-        random.seed(self.global_seed)
-        np.random.seed(self.global_seed)
+        """Seed Python, NumPy, and PyTorch with independent library-specific seeds."""
+        random.seed(self.random_seed)
+        np.random.seed(self.numpy_seed)
         try:
             import torch
 
-            torch.manual_seed(self.global_seed)
+            torch.manual_seed(self.torch_seed)
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.global_seed)
+                torch.cuda.manual_seed_all(self.torch_seed)
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
         except ImportError:
             pass
 
-    def make_env_rng(self) -> np.random.Generator:
-        return np.random.default_rng(self.env_seed)
-
-    def make_data_rng(self) -> np.random.Generator:
-        return np.random.default_rng(self.data_seed)
-
-    def make_eval_rng(self) -> np.random.Generator:
-        """Fixed RNG for evaluation — identical across runs."""
-        return np.random.default_rng(_derive_seed(self.global_seed, "eval"))
-
     def __repr__(self) -> str:
         return (
-            f"SeedManager(global={self.global_seed}, "
-            f"env={self.env_seed}, data={self.data_seed})"
+            f"SeedManager(random={self.random_seed}, "
+            f"numpy={self.numpy_seed}, torch={self.torch_seed})"
         )
 
 
@@ -170,7 +157,7 @@ class SeedManager:
 
 def obs_to_tensor(
     obs: Any,
-    device: str = "cpu",
+    device: str,
 ) -> Union[Any, "torch.Tensor"]:
     """
     Convert observation to tensor with batch dimension (B=1).
@@ -188,6 +175,9 @@ def obs_to_tensor(
         Tensorized observation with batch dimension added (B=1)
     """
     import torch
+
+    if device is None:
+        device = DEVICE
 
     if isinstance(obs, dict):
         result: dict = {}

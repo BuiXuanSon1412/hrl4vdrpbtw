@@ -14,7 +14,6 @@ Containers defined here
   StepResult    — everything returned by apply_action
   Solution      — decoded solution with objective and metadata
   SolutionPool  — fixed-capacity best-solution keeper
-  State         — abstract state representation (see core/state.py)
   Environment   — abstract MDP definition
 """
 
@@ -26,72 +25,6 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-
-
-"""
--------------
-Abstract state representation for MDP/environment abstraction.
-
-All environments track state internally and transition through states.
-A State encapsulates the complete problem state at a point in time.
-
-Design principle:
-  - Problem holds no mutable state
-  - State is immutable or at least semantically isolated
-  - Episode management (stateful reset/step) is separate from Problem (stateless)
-"""
-
-
-class State(ABC):
-    """
-    Abstract state representation for any MDP.
-
-    A state encapsulates:
-    - Decision variables (which node served, vehicle positions, etc.)
-    - Constraints (time windows, capacities, etc.)
-    - Derived quantities (cost, feasibility, etc.)
-
-    Implementations should be immutable or at least thread-safe.
-    """
-
-    @property
-    @abstractmethod
-    def is_terminal(self) -> bool:
-        """True if this state is terminal (no more actions possible)."""
-        ...
-
-    @property
-    @abstractmethod
-    def is_feasible(self) -> bool:
-        """True if solution represented by this state is feasible."""
-        ...
-
-    @abstractmethod
-    def to_dict(self) -> Dict[str, Any]:
-        """Serialize state to dict for checkpointing, logging, etc."""
-        ...
-
-    @classmethod
-    @abstractmethod
-    def from_dict(cls, data: Dict[str, Any]) -> State:
-        """Deserialize state from dict."""
-        ...
-
-
-# Example concrete implementation (defined in problems/vrpbtw.py):
-# class VRPBTWState(State):
-#     truck_node: np.ndarray  # (K,)
-#     truck_time: np.ndarray  # (K,)
-#     drone_node: np.ndarray  # (K,)
-#     ...
-#
-#     @property
-#     def is_terminal(self) -> bool:
-#         return all_nodes_served()
-#
-#     @property
-#     def is_feasible(self) -> bool:
-#         return all_time_windows_met()
 
 
 # ---------------------------------------------------------------------------
@@ -134,10 +67,10 @@ class StepResult:
     """Everything returned by Environment.apply_action."""
 
     next_state: Any
-    reward: float
     terminated: bool  # natural construction end
     truncated: bool  # external step-limit hit
     action_mask: ActionMask
+    reward: Optional[float] = None
     info: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -293,6 +226,9 @@ class Environment(ABC):
     @abstractmethod
     def observation_shape(self) -> Tuple[int, ...]: ...
 
+    @abstractmethod
+    def _generate_instance(self, task_id: str) -> Dict[str, Any]: ...
+
     # ------------------------------------------------------------------
     # Optional overrides
     # ------------------------------------------------------------------
@@ -315,23 +251,19 @@ class Environment(ABC):
         """Optional baseline objective (used for reward shaping)."""
         return None
 
-    def get_candidate_starts(self) -> List[Tuple[Any, Dict[str, Any], Dict[str, Any]]]:
+    def get_candidate_actions(self) -> np.ndarray:
         """
-        Return a list of candidate starting states for POMO or other multi-start algorithms.
+        Return indices of candidate first actions for POMO initialization.
 
-        Called AFTER encode_instance(). Each tuple is (state, obs, info) where info contains
-        'action_mask' and 'feasible_actions'.
-
-        Default: raises NotImplementedError. Concrete envs override this for algorithms
-        that benefit from multiple starting points (POMO, symmetry breaking, etc.).
+        Override to provide problem-specific first actions that reduce the action space.
+        Default: returns all feasible actions from initial state.
 
         Returns
         -------
-        list of (state, obs, info) tuples for each candidate start configuration.
+        np.ndarray: Indices of candidate first actions (subset of action space).
         """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} must implement get_candidate_starts() for POMO"
-        )
+        mask = self.get_action_mask(self._current_state)
+        return np.where(mask.mask)[0]
 
     @property
     def n_steps(self) -> int:
@@ -341,20 +273,17 @@ class Environment(ABC):
     # Stateful episode interface  (replaces Environment)
     # ------------------------------------------------------------------
 
-    def reset(
-        self, raw_instance: Any
-    ) -> Tuple[Union[np.ndarray, Dict[str, np.ndarray]], Dict[str, Any]]:
+    def reset(self) -> Tuple[Union[np.ndarray, Dict[str, np.ndarray]], Dict[str, Any]]:
         """
-        Encode a new instance and return the first observation.
+        Reset environment to initial state (without generating new instance).
 
         Returns
         -------
         obs  : observation dict/array from state_to_obs
         info : dict with 'action_mask' (bool array) and 'feasible_actions' (indices)
         """
-        self.encode_instance(raw_instance)
-        self._current_state = self.initial_state()
         self._n_steps = 0
+        self._current_state = self.initial_state()
         mask = self.get_action_mask(self._current_state)
         obs = self.state_to_obs(self._current_state)
         return obs, {
@@ -362,10 +291,22 @@ class Environment(ABC):
             "feasible_actions": mask.action_indices,
         }
 
+    def retask(self, task_id: str) -> None:
+        """
+        Set up environment for a specific task.
+
+        Uses global numpy RNG state set by seed_everything().
+
+        Args:
+            task_id: Task identifier.
+        """
+        raw_instance = self._generate_instance(task_id)
+        self.encode_instance(raw_instance)
+
     def step(
         self, action: int
     ) -> Tuple[
-        Union[np.ndarray, Dict[str, np.ndarray]], float, bool, bool, Dict[str, Any]
+        Union[np.ndarray, Dict[str, np.ndarray]], Optional[float], bool, bool, Dict[str, Any]
     ]:
         """
         Apply action to the current episode state.
@@ -373,7 +314,7 @@ class Environment(ABC):
         Returns
         -------
         obs        : next observation
-        reward     : float
+        reward     : Optional[float] — step reward or None if not computed
         terminated : bool — episode ended naturally
         truncated  : bool — episode ended by external limit (unused; always False)
         info       : dict with 'action_mask', 'feasible_actions', plus any result.info keys

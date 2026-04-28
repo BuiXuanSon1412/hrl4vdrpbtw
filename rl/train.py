@@ -37,17 +37,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import globals
 from config import load_config, merge_configs, save_config
-from core import (
-    Evaluator,
-    Logger,
-    SeedManager,
-)
-from registry import (
+from core import SeedManager
+from core.registry import (
     build_agent,
     build_environment,
+    build_evaluator,
+    build_logger,
     build_trainer,
-    get_vrpbtw_generator,
 )
 
 
@@ -112,6 +110,9 @@ def main() -> None:
     # Apply CLI overrides to hierarchical config
     if args.device:
         cfg["device"] = args.device
+
+    # Set global device for all rl components
+    globals.DEVICE = cfg.get("device", "cpu")
     if args.name:
         cfg["name"] = args.name
         if "experiment" not in cfg:
@@ -143,72 +144,44 @@ def main() -> None:
     reproducibility_cfg = cfg.get("reproducibility", {})
     seed_cfg = reproducibility_cfg.get("seed", cfg.get("seed", {}))
     seed_mgr = SeedManager(
-        global_seed=seed_cfg.get("global_seed", 42),
-        env_seed=seed_cfg.get("env_seed"),
-        data_seed=seed_cfg.get("data_seed"),
+        random_seed=seed_cfg.get("random_seed", 42),
+        numpy_seed=seed_cfg.get("numpy_seed", 42),
+        torch_seed=seed_cfg.get("torch_seed", 42),
     )
     seed_mgr.seed_everything()
-    data_rng = seed_mgr.make_data_rng()
     print(f"  {seed_mgr}")
 
-    # ── 3. Logger ───────────────────────────────────────────────────────
-    training_cfg = cfg.get("training", cfg.get("train", {}))
-    train_logging = training_cfg.get("logging", {})
+    # ── 3. Initialize logger and save config ────────────────────────────
+    logger = build_logger(cfg)
 
-    # Create experiment-specific output directories
-    base_checkpoint_dir = train_logging.get("checkpoint_dir", "experiment/train")
-    checkpoint_dir = Path(base_checkpoint_dir) / exp_name
-    log_dir = checkpoint_dir / "logs"
-    tensorboard_dir = checkpoint_dir / "tensorboard"
+    # Save merged config
+    logger.save_config(cfg)
+    logger_base_dir = Path(logger.config_path).parent
 
-    # Ensure directories exist
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    log_dir.mkdir(parents=True, exist_ok=True)
-
-    logger = Logger(
-        log_dir=str(log_dir),
-        experiment_name=exp_name,
-        verbose=True,
-    )
-
-    # ── 3b. Save config snapshot ────────────────────────────────────────
-    config_path = checkpoint_dir / f"{exp_name}_config.yaml"
-    save_config(cfg, str(config_path))
-    print(f"  Config saved: {config_path}")
+    print(f"  Experiment dir: {logger_base_dir}")
+    print(f"  Logs:           {logger.log_dir.relative_to(logger_base_dir)}")
+    print(f"  Checkpoints:    {logger.checkpoint_dir.relative_to(logger_base_dir)}")
+    print(f"  Config:         {logger.config_path.name}")
+    print(f"  Artifacts:      {logger.artifacts_dir.relative_to(logger_base_dir)}")
 
     # ── 4. Build components using registry pattern ──────────────────────
     # Build environment
     env = build_environment(cfg)
     print(f"  Environment: {type(env).__name__}")
 
-    # Build agent (composes policy + estimator)
-    agent = build_agent(cfg=cfg)
-    print(f"  Agent      : {agent}\n")
+    # Build agents from config (returns dict keyed by agent name)
+    agents = build_agent(cfg=cfg)
+    print(f"  Agents     : {list(agents.keys())}\n")
 
-    # Create instance generator for training/evaluation
-    generator = get_vrpbtw_generator(cfg)
-
-    # Build evaluator
-    eval_cfg = training_cfg.get("evaluation", cfg.get("evaluation", {}))
-    eval_decoding = eval_cfg.get("decoding", {})
-    n_eval_episodes = eval_cfg.get("n_eval_episodes", eval_cfg.get("n_episodes", 20))
-    deterministic = eval_cfg.get("deterministic", True)
-    beam_width = eval_decoding.get("beam_width", 1)
-
-    evaluator = Evaluator(
-        agent=agent,
-        env=env,
-        n_episodes=n_eval_episodes,
-        deterministic=deterministic,
-        beam_width=beam_width,
-    )
+    # Build evaluator using first available agent
+    agent = agents["agent"]
+    evaluator = build_evaluator(cfg, agent, env)
 
     # Build trainer using factory pattern (dispatched by cfg.trainer)
     trainer = build_trainer(
         cfg=cfg,
-        agent=agent,
+        agents=agents,
         env=env,
-        generator=generator,
         evaluator=evaluator,
         logger=logger,
     )

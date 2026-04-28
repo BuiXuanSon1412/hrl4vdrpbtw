@@ -71,6 +71,9 @@ class VRPBTWState:
     drone_launch_time: np.ndarray
     drone_active: np.ndarray
     drone_launch_node: np.ndarray  # (K,) truck node at which drone k last launched
+    drone_phase: (
+        np.ndarray
+    )  # (K,) phase when drone k launched (locked for trip duration)
 
     # Global
     served: np.ndarray  # (N+1,) bool
@@ -97,6 +100,7 @@ def _copy_state(s: VRPBTWState) -> VRPBTWState:
         drone_launch_time=s.drone_launch_time.copy(),
         drone_active=s.drone_active.copy(),
         drone_launch_node=s.drone_launch_node.copy(),
+        drone_phase=s.drone_phase.copy(),
         served=s.served.copy(),
         current_cost=s.current_cost,
         current_max_tard=s.current_max_tard,
@@ -114,6 +118,12 @@ def _copy_state(s: VRPBTWState) -> VRPBTWState:
 class VRPBTWEnv(Environment):
     def __init__(self, cfg: Dict[str, Any]):
         super().__init__(name="VRPBTW")
+        # Task ID (set when reset() is called with task_id)
+        self.task_id: Optional[str] = None
+
+        # Available tasks from config (task_id format: "{difficulty}_N{customers}_F{fleets}_{distribution}")
+        self.tasks: List[str] = cfg.get("tasks", [])
+
         # Instance parameters (set dynamically in reset via encode_instance)
         self.n_customers: int = 10
         self.n_fleets: int = 2
@@ -140,6 +150,20 @@ class VRPBTWEnv(Environment):
         self.c_d: float = float(cfg.get("drone_cost_unit", 0.5))
         self.launch_time: float = float(cfg.get("drone_takeoff_min", 1.0)) / 60.0
         self.land_time: float = float(cfg.get("drone_landing_min", 1.0)) / 60.0
+        self.service_time: float = float(cfg.get("service_time_min", 5.0)) / 60.0
+
+        # Instance generation parameters (for _generate_instance)
+        self.demand_range_linehaul: Tuple[int, int] = (
+            int(cfg.get("demand_range_linehaul_min", 5)),
+            int(cfg.get("demand_range_linehaul_max", 10)),
+        )
+        self.demand_range_backhaul: Tuple[int, int] = (
+            int(cfg.get("demand_range_backhaul_min", 5)),
+            int(cfg.get("demand_range_backhaul_max", 10)),
+        )
+        self.time_window_scaling_factor: float = float(
+            cfg.get("time_window_scaling_factor", 1.0)
+        )
 
         self._linehaul_idx: np.ndarray = np.array([], dtype=np.int32)
         self._backhaul_idx: np.ndarray = np.array([], dtype=np.int32)
@@ -149,11 +173,159 @@ class VRPBTWEnv(Environment):
         """Factory method: instantiate VRPBTWEnv from config dict.
 
         Instance-specific parameters (n_customers, n_fleets) are set dynamically
-        in reset() via encode_instance() when raw_instance is provided.
+        in reset() via _generate_instance() when task_id is provided.
         """
         # Support both old (flat) and new (properties) structure
         props = cfg.get("properties", cfg)
         return cls(props)
+
+    # ------------------------------------------------------------------
+    # Instance generation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _parse_task_id(task_id: str) -> Tuple[int, int, str]:
+        """Parse task ID format: {difficulty}_N{customers}_F{fleets}_{distribution}.
+
+        Returns: (n_customers, n_fleets, distribution)
+        Example: "001_N10_F2_RC" -> (10, 2, "RC")
+        """
+        parts = task_id.split("_")
+        if len(parts) < 4:
+            raise ValueError(f"Invalid task_id format: {task_id!r}")
+
+        try:
+            n_customers = int(parts[1][1:])  # Skip 'N'
+            n_fleets = int(parts[2][1:])  # Skip 'F'
+            dist = parts[3]
+        except (ValueError, IndexError) as e:
+            raise ValueError(f"Failed to parse task_id {task_id!r}: {e}")
+
+        return n_customers, n_fleets, dist
+
+    def _generate_coords(self, num_customers: int, dist_type: str) -> List[List[float]]:
+        """Generate customer coordinates based on distribution type (R, C, RC).
+        Uses global numpy RNG state set by seed_everything().
+        """
+        if dist_type == "R":
+            return np.random.uniform(
+                0, self.max_coord, size=(num_customers, 2)
+            ).tolist()
+
+        elif dist_type == "C":
+            coords = []
+            remaining_nodes = num_customers
+
+            if num_customers <= 200:
+                std_dev = self.max_coord / 25
+            elif num_customers <= 400:
+                std_dev = self.max_coord / 32
+            else:
+                std_dev = self.max_coord / 40
+            min_dist = std_dev * 4
+
+            centers = []
+            while remaining_nodes > 0:
+                current_cluster_size = min(
+                    remaining_nodes, int(np.random.uniform(10, 16))
+                )
+
+                proposal = np.random.uniform(5, self.max_coord - 5, size=(2,))
+                valid_center = False
+                attempts = 0
+                while not valid_center and attempts < 1000:
+                    proposal = np.random.uniform(5, self.max_coord - 5, size=(2,))
+                    if not centers:
+                        valid_center = True
+                    else:
+                        dists = [
+                            np.linalg.norm(proposal - np.array(c)) for c in centers
+                        ]
+                        if min(dists) >= min_dist:
+                            valid_center = True
+                    attempts += 1
+
+                centers.append(proposal.tolist())
+
+                for _ in range(current_cluster_size):
+                    point = np.random.normal(proposal, std_dev)
+                    coords.append(np.clip(point, 0, self.max_coord).tolist())
+
+                remaining_nodes -= current_cluster_size
+
+            return coords
+
+        elif dist_type == "RC":
+            n_c = num_customers // 2
+            return self._generate_coords(n_c, "C") + self._generate_coords(
+                num_customers - n_c, "R"
+            )
+
+        raise ValueError(f"Unknown distribution type: {dist_type}")
+
+    def _generate_instance(self, task_id: str) -> Dict[str, Any]:
+        """Generate modifiable VRPBTW instance attributes from task_id.
+
+        Args:
+            task_id: Task ID in format "{difficulty}_N{customers}_F{fleets}_{distribution}"
+
+        Returns:
+            Dict with modifiable attributes (depot, customers, n_fleets).
+            Static attributes (capacities, speeds, etc.) are already on self.
+
+        Uses global numpy RNG state set by seed_everything().
+        """
+        n_customers, n_fleets, dist_type = self._parse_task_id(task_id)
+
+        # Generate coordinates using global numpy RNG (seeded by seed_everything())
+        coords = self._generate_coords(n_customers, dist_type)
+        depot_coord = [self.max_coord / 2.0, self.max_coord / 2.0]
+
+        # Generate customers with time windows and demands
+        customers = []
+        linehaul_count = int(n_customers * 0.5)
+        types = ["LINEHAUL"] * linehaul_count + ["BACKHAUL"] * (
+            n_customers - linehaul_count
+        )
+        np.random.shuffle(types)
+
+        for i in range(n_customers):
+            node_type = types[i]
+            demand_range = (
+                self.demand_range_linehaul
+                if node_type == "LINEHAUL"
+                else self.demand_range_backhaul
+            )
+
+            dist_km = np.linalg.norm(np.array(coords[i]) - np.array(depot_coord))
+            min_reach_time = dist_km / self.v_t
+            ready_h = float(np.random.uniform(min_reach_time * 1.1, self.T_max * 0.7))
+            width_h = float(
+                np.random.uniform(
+                    1.0,
+                    1.0
+                    + (self.time_window_scaling_factor * (dist_km / self.max_coord)),
+                )
+            )
+
+            demand = float(int(np.random.randint(demand_range[0], demand_range[1] + 1)))
+            if node_type == "BACKHAUL":
+                demand = -demand
+            customers.append(
+                [
+                    float(coords[i][0]),
+                    float(coords[i][1]),
+                    float(round(ready_h, 4)),
+                    float(round(min(ready_h + width_h, self.T_max), 4)),
+                    demand,
+                ]
+            )
+
+        return {
+            "depot": depot_coord,
+            "customers": customers,
+            "n_fleets": n_fleets,
+        }
 
     # ------------------------------------------------------------------
     # encode_instance
@@ -169,12 +341,9 @@ class VRPBTWEnv(Environment):
 
         coords_all = np.vstack([depot, customers[:, :2]])
         tw_open_all = np.concatenate([[0.0], customers[:, 2]])
-        tw_close_all = np.concatenate(
-            [[float(raw_instance["system_duration"])], customers[:, 3]]
-        )
+        tw_close_all = np.concatenate([[self.T_max], customers[:, 3]])
         demands_all = np.concatenate([[0.0], customers[:, 4]])
-        svc = float(raw_instance.get("service_time", 0.0))
-        svc_all = np.full(self.n_customers + 1, svc, dtype=np.float32)
+        svc_all = np.full(self.n_customers + 1, self.service_time, dtype=np.float32)
         svc_all[DEPOT] = 0.0
 
         self.coords = coords_all.astype(np.float32)
@@ -188,18 +357,6 @@ class VRPBTWEnv(Environment):
         self.euclidean_dist = np.sqrt(dx**2 + dy**2).astype(np.float32)
         self.manhattan_dist = (np.abs(dx) + np.abs(dy)).astype(np.float32)
 
-        self.Q_t = float(raw_instance["truck_capacity"])
-        self.Q_d = float(raw_instance["drone_capacity"])
-        self.T_max = float(raw_instance["system_duration"])
-        self.t_max = float(raw_instance["trip_duration"])
-        self.v_t = float(raw_instance["truck_speed"])
-        self.v_d = float(raw_instance["drone_speed"])
-        self.c_t = float(raw_instance["truck_cost"])
-        self.c_d = float(raw_instance["drone_cost"])
-        self.launch_time = float(raw_instance.get("launch_time", 0.0))
-        self.land_time = float(raw_instance.get("land_time", 0.0))
-        self.max_coord = float(raw_instance.get("max_coord", 100.0))
-
         cust_d = self.demands[1:]
         self._linehaul_idx = (np.where(cust_d > 0)[0] + 1).astype(np.int32)
         self._backhaul_idx = (np.where(cust_d < 0)[0] + 1).astype(np.int32)
@@ -207,23 +364,6 @@ class VRPBTWEnv(Environment):
     # ------------------------------------------------------------------
     # reset override — computes nadir internally before returning state
     # ------------------------------------------------------------------
-
-    def reset(self, raw_instance: Any) -> Tuple[Dict, Dict[str, Any]]:
-        """
-        Encode the instance and return the first observation.
-
-        Returns (obs, info) tuple where obs is the state dict and info
-        contains action_mask and feasible_actions.
-        """
-        self.encode_instance(raw_instance)
-        self._n_steps = 0
-        self._current_state = self.initial_state()
-        mask = self.get_action_mask(self._current_state)
-        obs = self.state_to_obs(self._current_state)
-        return obs, {
-            "action_mask": mask.mask,
-            "feasible_actions": mask.action_indices,
-        }
 
     # ------------------------------------------------------------------
     # Objective functions
@@ -251,6 +391,25 @@ class VRPBTWEnv(Environment):
         unserved_penalty = self.c_t * max_dist * N * (N - k)
         return cost + unserved_penalty
 
+    def compute_return(self) -> float:
+        """Compute return from current solution: -objective / (max_dist * max_cost_unit).
+
+        Gets solution from current state, extracts objective, negates it to convert
+        from cost minimization to return maximization, and normalizes by both spatial
+        and cost scales for scale-independence across instances.
+
+        Returns
+        -------
+        float
+            Normalized return in range [-(N^2), ~0]:
+            - Worst (no customers served): ~-(N^2) where N = n_customers
+            - Best (all served, minimal cost): ~0 or slightly negative
+        """
+        solution = self.current_solution()
+        normalized_factor = (
+            2.0 * self.max_coord * max(self.c_t, self.c_d) * self.n_customers
+        )
+        return -solution.objective / normalized_factor
 
     # ------------------------------------------------------------------
     # initial_state
@@ -271,10 +430,11 @@ class VRPBTWEnv(Environment):
             drone_launch_time=np.zeros(K, dtype=np.float32),
             drone_active=np.zeros(K, dtype=bool),
             drone_launch_node=np.zeros(K, dtype=np.int32),
+            drone_phase=np.zeros(K, dtype=np.int32),
             served=served,
             current_cost=0.0,
             current_max_tard=0.0,
-            truck_routes=[[] for _ in range(K)],
+            truck_routes=[[DEPOT] for _ in range(K)],
             drone_route_nodes=[[] for _ in range(K)],
             drone_route_mask=[[] for _ in range(K)],
         )
@@ -316,9 +476,10 @@ class VRPBTWEnv(Environment):
                     for j in range(1, N1):
                         if self._drone_extend_feasible(state, k, j):
                             mask[self.encode_action(j, v_idx)] = True
-                    for land in self._landing_nodes(state, k):
-                        if self._drone_land_feasible(state, k, land):
-                            mask[self.encode_action(land, v_idx)] = True
+                    for land_idx in self._landing_nodes(state, k):
+                        if self._drone_land_feasible(state, k, land_idx):
+                            land_node = state.truck_routes[k][land_idx]
+                            mask[self.encode_action(land_node, v_idx)] = True
                 else:
                     for j in range(1, N1):
                         if self._drone_launch_feasible(state, k, j):
@@ -332,12 +493,9 @@ class VRPBTWEnv(Environment):
 
     def _landing_nodes(self, state: VRPBTWState, k: int) -> List[int]:
         """
-        Return every node the truck visited strictly after the drone's launch
-        node, plus the depot.  Landing at the launch node itself is forbidden.
-
-        The truck route is searched from the end to find the most recent
-        occurrence of drone_launch_node[k], then all subsequent entries
-        (including DEPOT if the truck has returned) are valid candidates.
+        Return indices into truck_routes[k] where drone can land.
+        Drone can land at nodes visited strictly after launch node.
+        Node at index i retrieved via: truck_routes[k][i]
         """
         launch_node = int(state.drone_launch_node[k])
         route = state.truck_routes[k]
@@ -349,21 +507,54 @@ class VRPBTWEnv(Environment):
                 launch_idx = i
                 break
 
-        # All nodes the truck visited after the launch node
-        after_launch: set = (
-            set(route[launch_idx + 1 :]) if launch_idx >= 0 else set(route)
-        )
+        # Return indices of all nodes after launch
+        return list(range(launch_idx + 1, len(route)))
 
-        # DEPOT is always reachable as a terminal landing point
-        after_launch.add(DEPOT)
+    def _late_land_feasible(
+        self, state: VRPBTWState, k: int, land_idx: int, drone_land_time: float
+    ) -> bool:
+        """
+        If drone lands at truck_routes[k][land_idx] at drone_land_time (possibly late),
+        check if truck can still service all subsequent nodes without missing customers.
 
-        # Landing at the launch node itself is forbidden
-        after_launch.discard(launch_node)
+        Simulates truck's remaining route from landing node with new ready time.
+        """
+        route = state.truck_routes[k]
+        land_node = route[land_idx]
+        t = drone_land_time
+        node = land_node
 
-        return list(after_launch)
+        # Simulate remaining route from landing node onwards
+        for i in range(land_idx + 1, len(route)):
+            next_node = route[i]
+            dist = self.manhattan_dist[node, next_node]
+            arrive = t + dist / self.v_t
 
-    def _phase_ok(self, state: VRPBTWState, k: int, j: int) -> bool:
+            # Check time window feasibility for next_node
+            if arrive > self.tw_close[next_node]:
+                return False  # Can't reach next_node on time
+
+            service_start = max(arrive, self.tw_open[next_node])
+            t = service_start + self.service_times[next_node]
+            node = next_node
+
+        # Check return to depot is feasible
+        dist_to_depot = self.manhattan_dist[node, DEPOT]
+        return t + dist_to_depot / self.v_t <= self.T_max
+
+    def _truck_phase_ok(self, state: VRPBTWState, k: int, j: int) -> bool:
+        """Check if truck can serve node j based on truck's current phase."""
         phase = int(state.truck_phase[k])
+        demand = self.demands[j]
+        if phase == 0 and demand < 0:
+            return False
+        if phase == 1 and demand > 0:
+            return False
+        return True
+
+    def _drone_phase_ok(self, state: VRPBTWState, k: int, j: int) -> bool:
+        """Check if drone can serve node j based on drone's locked launch phase."""
+        phase = int(state.drone_phase[k])
         demand = self.demands[j]
         if phase == 0 and demand < 0:
             return False
@@ -374,7 +565,11 @@ class VRPBTWEnv(Environment):
     def _truck_feasible(self, state: VRPBTWState, k: int, j: int) -> bool:
         if j == DEPOT or state.served[j]:
             return False
-        if not self._phase_ok(state, k, j):
+        # Prevent serving after returning to depot: if truck is at DEPOT and route has more than initial DEPOT,
+        # the truck has already returned and cannot serve more
+        if int(state.truck_node[k]) == DEPOT and len(state.truck_routes[k]) > 1:
+            return False
+        if not self._truck_phase_ok(state, k, j):
             return False
         new_load = state.truck_load[k] - self.demands[j]
         if new_load < 0 or new_load > self.Q_t:
@@ -397,16 +592,22 @@ class VRPBTWEnv(Environment):
         return float(state.drone_time[k] - state.drone_launch_time[k])
 
     def _min_return_time(self, state: VRPBTWState, k: int, from_node: int) -> float:
-        times = [self.euclidean_dist[from_node, DEPOT] / self.v_d]
-        t_node = int(state.truck_node[k])
-        if t_node != DEPOT:
-            times.append(self.euclidean_dist[from_node, t_node] / self.v_d)
-        return float(min(times))
+        """Minimum flight time from from_node to any unserved node.
+
+        Returns the minimum time for drone to reach a landing node (where truck can be).
+        If no feasible landing node exists, returns infinity.
+        """
+        unserved_nodes = ~state.served
+        reachable_nodes = np.where(unserved_nodes)[0]
+        if len(reachable_nodes) == 0:
+            return float("inf")
+        distances = self.euclidean_dist[from_node, reachable_nodes]
+        return float(np.min(distances)) / self.v_d
 
     def _drone_launch_feasible(self, state: VRPBTWState, k: int, j: int) -> bool:
         if state.drone_active[k] or state.served[j]:
             return False
-        if not self._phase_ok(state, k, j):
+        if not self._truck_phase_ok(state, k, j):
             return False
         new_load = state.drone_load[k] - self.demands[j]
         if new_load < 0 or new_load > self.Q_d:
@@ -427,7 +628,7 @@ class VRPBTWEnv(Environment):
     def _drone_extend_feasible(self, state: VRPBTWState, k: int, j: int) -> bool:
         if not state.drone_active[k] or state.served[j]:
             return False
-        if not self._phase_ok(state, k, j):
+        if not self._drone_phase_ok(state, k, j):
             return False
         new_load = state.drone_load[k] - self.demands[j]
         if new_load < 0 or new_load > self.Q_d:
@@ -442,15 +643,70 @@ class VRPBTWEnv(Environment):
         elapsed = self._elapsed_trip_time(state, k)
         return elapsed + t_to_j + t_back <= self.t_max
 
-    def _drone_land_feasible(self, state: VRPBTWState, k: int, land: int) -> bool:
+    def _drone_land_feasible(self, state: VRPBTWState, k: int, land_idx: int) -> bool:
+        """Check if drone can land at truck_routes[k][land_idx] without losing customers.
+
+        Args:
+            land_idx: index into truck_routes[k]
+        """
         if not state.drone_active[k]:
             return False
+
+        land_node = state.truck_routes[k][land_idx]
         from_node = int(state.drone_node[k])
-        t_back = self.euclidean_dist[from_node, land] / self.v_d
+        t_back = self.euclidean_dist[from_node, land_node] / self.v_d
         elapsed = self._elapsed_trip_time(state, k)
+
         if elapsed + t_back > self.t_max:
             return False
-        return state.drone_time[k] + t_back + self.land_time <= self.T_max
+
+        drone_land_time = state.drone_time[k] + t_back + self.land_time
+        if drone_land_time > self.T_max:
+            return False
+
+        # Check if late landing would cause truck to miss future customers
+        return self._late_land_feasible(state, k, land_idx, drone_land_time)
+
+    # ------------------------------------------------------------------
+    # Infeasible action handling
+    # ------------------------------------------------------------------
+
+    def _compute_drone_trip_cost(self, state: VRPBTWState, k: int) -> float:
+        """Compute total euclidean distance cost of current drone trip."""
+        cost = 0.0
+        prev = DEPOT
+        for node in state.drone_route_nodes[k]:
+            cost += self.euclidean_dist[prev, node]
+            prev = node
+        return cost
+
+    def _rollback_drone_trip(self, state: VRPBTWState, k: int) -> float:
+        """
+        Rollback entire drone trip: undo served nodes, reset drone to inactive.
+
+        Returns the distance cost incurred by the trip (for reward calculation).
+        """
+        trip_cost = self._compute_drone_trip_cost(state, k)
+
+        # Unserve all nodes visited on this trip
+        for node in state.drone_route_nodes[k]:
+            if node != DEPOT and 1 <= node < len(state.served):
+                state.served[node] = False
+
+        # Reset drone to inactive state at truck location with truck's current time
+        state.drone_active[k] = False
+        state.drone_node[k] = state.truck_node[k]
+        state.drone_load[k] = self.Q_d
+        state.drone_time[k] = state.truck_time[k]
+
+        # Clear trip routes
+        state.drone_route_nodes[k] = []
+        state.drone_route_mask[k] = []
+
+        # Revert trip cost
+        state.current_cost -= trip_cost
+
+        return trip_cost
 
     # ------------------------------------------------------------------
     # apply_action
@@ -460,18 +716,20 @@ class VRPBTWEnv(Environment):
         node, v_idx = self.decode_action(action)
         k, vtype = self.vehicle_fleet_type(v_idx)
 
-        # Snapshot objective before transition
-        served_before = int(state.served[1:].sum())
-        obj_before = self._compute_objective(state.current_cost, served_before)
-
         state = _copy_state(state)
 
+        # Apply action (assumed feasible — policy ensures this)
         if vtype == TRUCK:
             self._apply_truck(state, k, node)
-        else:
+        else:  # DRONE
             if state.drone_active[k]:
-                landing = self._landing_nodes(state, k)
-                if node in landing:
+                landing_indices = self._landing_nodes(state, k)
+                # Check if node is a valid landing location
+                is_landing = any(
+                    state.truck_routes[k][idx] == node for idx in landing_indices
+                )
+
+                if is_landing:
                     self._apply_drone_land(state, k, node)
                 else:
                     self._apply_drone_extend(state, k, node)
@@ -479,7 +737,6 @@ class VRPBTWEnv(Environment):
                 self._apply_drone_launch(state, k, node)
 
         terminated = self._is_terminated(state)
-        infeasible_end = False
 
         next_mask = (
             self.get_action_mask(state)
@@ -487,20 +744,46 @@ class VRPBTWEnv(Environment):
             else ActionMask.all_valid(self.action_space_size)
         )
         if not terminated and next_mask.is_empty():
-            terminated = True
-            infeasible_end = True
+            # Remove incomplete drone trips before terminating
+            for k in range(self.K):
+                if state.drone_active[k]:
+                    launch_node = int(state.drone_launch_node[k])
+                    route = state.drone_route_nodes[k]
+                    mask = state.drone_route_mask[k]
 
-        # ── Reward: potential-based shaping with new objective ──
-        if terminated and infeasible_end:
-            reward = -1e6
-        else:
-            served_after = int(state.served[1:].sum())
-            obj_after = self._compute_objective(state.current_cost, served_after)
-            reward = -(obj_after - obj_before)
+                    # Find where this trip started (last occurrence of launch_node marked as 0)
+                    launch_idx = -1
+                    for i in range(len(route) - 1, -1, -1):
+                        if route[i] == launch_node and mask[i] == 0:
+                            launch_idx = i
+                            break
+
+                    if launch_idx >= 0:
+                        # Unserve customers served in incomplete trip
+                        for i in range(launch_idx + 1, len(route)):
+                            if mask[i] == 1:
+                                node = route[i]
+                                state.served[node] = False
+
+                        # Remove incomplete trip from route
+                        state.drone_route_nodes[k] = state.drone_route_nodes[k][
+                            : launch_idx + 1
+                        ]
+                        state.drone_route_mask[k] = state.drone_route_mask[k][
+                            : launch_idx + 1
+                        ]
+
+                    # Reset drone to idle at launch node, load based on phase
+                    phase = int(state.truck_phase[k])
+                    state.drone_active[k] = False
+                    state.drone_phase[k] = phase
+                    state.drone_node[k] = launch_node
+                    state.drone_load[k] = self.Q_d if phase == 0 else 0.0
+
+            terminated = True
 
         return StepResult(
             next_state=state,
-            reward=reward,
             terminated=terminated,
             truncated=False,
             action_mask=next_mask,
@@ -552,6 +835,7 @@ class VRPBTWEnv(Environment):
         state.drone_node[k] = j
         state.drone_load[k] -= self.demands[j]
         state.drone_active[k] = True
+        state.drone_phase[k] = int(state.truck_phase[k])
         state.served[j] = True
         self._update_phase(state, k)
 
@@ -590,6 +874,7 @@ class VRPBTWEnv(Environment):
         state.drone_time[k] = arrive
         state.drone_node[k] = land
         state.drone_active[k] = False
+        state.drone_phase[k] = int(state.truck_phase[k])
         state.drone_load[k] = self.Q_d
         state.drone_launch_time[k] = arrive
 
@@ -616,7 +901,9 @@ class VRPBTWEnv(Environment):
     # ------------------------------------------------------------------
 
     def _is_terminated(self, state: VRPBTWState) -> bool:
-        return bool(state.served[1:].all()) and not state.drone_active.any()
+        drones_idle = not state.drone_active.any()
+        trucks_at_depot = bool((state.truck_node == DEPOT).all())
+        return drones_idle and trucks_at_depot
 
     # ------------------------------------------------------------------
     # state_to_obs
@@ -682,7 +969,9 @@ class VRPBTWEnv(Environment):
 
         # Normalize time by the longest possible distance / slowest vehicle speed
         # This puts the entire temporal range in [0, 1] and is consistent across instances
-        T = max_dist / min(self.v_t, self.v_d)  # time to traverse longest path at slowest speed
+        T = max_dist / min(
+            self.v_t, self.v_d
+        )  # time to traverse longest path at slowest speed
 
         mc = max(self.c_t, self.c_d) + 1e-8  # max cost unit
         norm_cost_denom = max_dist * mc  # cost normalisation denominator
@@ -780,13 +1069,16 @@ class VRPBTWEnv(Environment):
         # attention encoders (NodeEncoder / VehicleEncoder) but receive no GNN
         # message aggregation — their Z_graph embedding is feature-only.
 
-        keep_truck = ~state.served.copy()  # unserved customers
+        keep_truck = ~state.served  # unserved customers
         keep_truck[DEPOT] = True
         for k in range(self.K):
             keep_truck[int(state.truck_node[k])] = True  # current truck pos
             if state.drone_active[k]:
-                for lc in self._landing_nodes(state, k):  # landing candidates
-                    keep_truck[lc] = True
+                for lc_idx in self._landing_nodes(
+                    state, k
+                ):  # landing candidates (route indices)
+                    lc_node = state.truck_routes[k][lc_idx]
+                    keep_truck[lc_node] = True
 
         keep_drone = keep_truck.copy()
         for k in range(self.K):
@@ -857,7 +1149,6 @@ class VRPBTWEnv(Environment):
         served_count = int(state.served[1:].sum())
         return total_cost, served_count
 
-
     def is_complete(self, state: VRPBTWState) -> bool:
         return self._is_terminated(state)
 
@@ -878,7 +1169,6 @@ class VRPBTWEnv(Environment):
                 "unserved": int((~state.served[1:]).sum()),
             },
         )
-
 
     # ------------------------------------------------------------------
     # Properties
@@ -904,43 +1194,26 @@ class VRPBTWEnv(Environment):
     def backhaul_indices(self) -> np.ndarray:
         return self._backhaul_idx
 
-    def get_candidate_starts(self) -> List[Tuple[Any, Dict, Dict]]:
+    def get_starting_actions(self) -> np.ndarray:
         """
-        Return candidate starting states for POMO.
+        Return candidate first actions for POMO: linehaul customers with first fleet (truck and drone).
 
-        For each linehaul customer j, create a starting state where truck 0 (fleet index 0)
-        has just been dispatched to j. This ensures:
-        - All candidates are feasible (truck 0 can reach each linehaul customer from depot)
-        - Diversity in starting configurations
-        - Truck 0 always takes the first action (to a linehaul customer)
+        For backhaul VRP, linehaul customers must be served first, and only the first
+        fleet can make the initial dispatch. This includes both truck and drone options
+        for each linehaul customer, reducing the candidate action space.
+
+        Vehicle indices for first fleet (fleet 0):
+        - Truck: vehicle_idx = 0
+        - Drone: vehicle_idx = K
 
         Returns
         -------
-        list of (state, obs, info) — one per linehaul customer. If no linehaul customers
-        are feasible, returns a single tuple with the initial state.
+        np.ndarray: Indices of candidate actions (linehaul customers with first fleet vehicles).
         """
-        candidates = []
-        s0 = self.initial_state()
-
+        starting_actions = []
         for j in self._linehaul_idx:
-            action = self.encode_action(int(j), 0)
-            result = self.apply_action(s0, action)
-
-            if not result.terminated and not result.action_mask.is_empty():
-                obs = self.state_to_obs(result.next_state)
-                info = {
-                    "action_mask": result.action_mask.mask,
-                    "feasible_actions": result.action_mask.action_indices,
-                }
-                candidates.append((result.next_state, obs, info))
-
-        if not candidates:
-            obs = self.state_to_obs(s0)
-            mask = self.get_action_mask(s0)
-            info = {
-                "action_mask": mask.mask,
-                "feasible_actions": mask.action_indices,
-            }
-            candidates.append((s0, obs, info))
-
-        return candidates
+            # Truck for first fleet (0)
+            starting_actions.append(self.encode_action(int(j), 0))
+            # Drone for first fleet (K)
+            starting_actions.append(self.encode_action(int(j), self.K))
+        return np.array(starting_actions, dtype=np.int64)

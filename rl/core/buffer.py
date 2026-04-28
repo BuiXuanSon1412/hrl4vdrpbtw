@@ -45,11 +45,11 @@ class Transition:
 
     obs: Any                          # dict of numpy arrays, exact problem size
     action: int
-    reward: float
     done: bool
-    log_prob: float
-    value: float
+    log_prob: Any                     # torch.Tensor or float (for compatibility)
     action_mask: np.ndarray           # (action_space_size,) bool, exact size
+    reward: Optional[float] = None    # float or None (optional)
+    value: Optional[Any] = None       # torch.Tensor or float (optional, for compatibility)
 
 
 # ---------------------------------------------------------------------------
@@ -79,11 +79,11 @@ class RolloutBuffer:
         self,
         obs: Any,
         action: int,
-        reward: float,
         done: bool,
-        log_prob: float,
-        value: float,
+        log_prob: Any,                 # torch.Tensor or float
         action_mask: np.ndarray,
+        reward: Optional[float] = None,  # float or None (optional)
+        value: Optional[Any] = None,     # torch.Tensor or float (optional)
     ) -> None:
         assert self._ptr < self.capacity, "RolloutBuffer is full."
 
@@ -99,11 +99,11 @@ class RolloutBuffer:
         tr = Transition(
             obs=obs_stored,
             action=int(action),
-            reward=float(reward),
             done=bool(done),
-            log_prob=float(log_prob),
-            value=float(value),
+            log_prob=log_prob,            # Keep as-is (tensor or float)
             action_mask=action_mask.copy(),
+            reward=float(reward) if reward is not None else None,  # Convert to float or None
+            value=value,                  # Keep as-is (tensor or float, or None)
         )
 
         if self._ptr < len(self._data):

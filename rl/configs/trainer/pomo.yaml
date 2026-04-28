@@ -9,16 +9,31 @@
 trainer:
   name: pomo
 
-  agent:
-    name: policy
-    learning_rate: 0.001
-    estimator: reinforce
-    optimizer: adam
-    rollout_length: None
+  phase:
+    training:
+      enabled: true
+      
+      discount_factor: 0.999
+      
+      control:
+        epochs: 100
+        batches_per_epoch: 100
+        instances_per_batch: 10
+        eval_instances: 20
+        logging:
+          log_interval: 1
+          checkpoint_interval: 10
+        evaluation:
+          deterministic: true
+          decoding:
+            beam_width: 1
 
-  hparams:
-    max_grad_norm: 0.5
+      agents:
+        agent:
+          name: policy
+          learning_rate: 0.001
+          optimizer: adam
+          rollout_length: 256
+          max_grad_norm: 0.5
 
-  evaluation:
-    eval_interval: 100
-    n_eval_episodes: 20
+      

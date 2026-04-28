@@ -1,0 +1,27 @@
+# evaluate.yaml
+# Standalone evaluation configuration
+#
+# Loads a trained checkpoint and evaluates it on fresh instances.
+# Environment and policy configs are loaded from training experiment.
+
+device: cpu
+
+reproducibility:
+  seed:
+    random_seed: 42
+    numpy_seed: 42
+    torch_seed: 42
+
+experiment:
+  name: 001
+
+directories:
+  source: 001_pomo
+  base_dir: experiment/evaluate
+  artifacts: artifacts
+
+evaluation:
+  deterministic: true
+  n_eval_episodes: 100
+  decoding:
+    beam_width: 1

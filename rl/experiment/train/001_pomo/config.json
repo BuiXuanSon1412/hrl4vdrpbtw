@@ -1,0 +1,111 @@
+{
+  "trainer": {
+    "name": "pomo",
+    "phase": {
+      "training": {
+        "enabled": true,
+        "discount_factor": 0.999,
+        "control": {
+          "epochs": 100,
+          "batches_per_epoch": 100,
+          "instances_per_batch": 10,
+          "eval_instances": 20,
+          "logging": {
+            "log_interval": 50,
+            "checkpoint_interval": 10
+          },
+          "evaluation": {
+            "deterministic": true,
+            "decoding": {
+              "beam_width": 1
+            }
+          }
+        },
+        "agents": {
+          "agent": {
+            "name": "policy",
+            "learning_rate": 0.001,
+            "optimizer": "adam",
+            "rollout_length": 256,
+            "max_grad_norm": 0.5
+          }
+        }
+      }
+    }
+  },
+  "policy": {
+    "name": "hgnn",
+    "network": {
+      "encoder": {
+        "node_encoder": {
+          "embedding_dim": 128,
+          "n_heads": 4,
+          "n_layers": 3,
+          "dropout": 0.1,
+          "use_instance_norm": true
+        },
+        "vehicle_encoder": {
+          "embedding_dim": 128,
+          "n_heads": 4,
+          "n_layers": 3,
+          "dropout": 0.1,
+          "use_instance_norm": true
+        },
+        "graph_encoder": {
+          "embedding_dim": 128,
+          "n_layers": 3,
+          "dropout": 0.1
+        }
+      },
+      "decoder": {
+        "node_decoder": {
+          "embedding_dim": 128,
+          "clip": 10.0,
+          "activation": "relu"
+        },
+        "vehicle_decoder": {
+          "embedding_dim": 128,
+          "clip": 10.0,
+          "activation": "relu"
+        }
+      }
+    }
+  },
+  "environment": {
+    "name": "vrpbtw",
+    "properties": {
+      "max_coord": 100.0,
+      "capacity_truck": 200,
+      "capacity_drone": 20,
+      "v_truck_km_h": 40.0,
+      "v_drone_km_h": 60.0,
+      "truck_cost_unit": 1.0,
+      "drone_cost_unit": 0.5,
+      "t_max_system_h": 24.0,
+      "drone_duration_h": 1.0,
+      "drone_takeoff_min": 1.0,
+      "drone_landing_min": 1.0,
+      "service_time_min": 5.0,
+      "tasks": [
+        "002_N10_F2_R"
+      ]
+    }
+  },
+  "device": "cpu",
+  "reproducibility": {
+    "seed": {
+      "random_seed": 42,
+      "numpy_seed": 42,
+      "torch_seed": 42
+    }
+  },
+  "experiment": {
+    "name": "001_pomo",
+    "description": "initial experiment"
+  },
+  "logger": {
+    "base_dir": "experiment/train",
+    "verbose": true,
+    "tensorboard": false
+  }
+}

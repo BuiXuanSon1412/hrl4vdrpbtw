@@ -4,25 +4,35 @@ core/logger.py
 Structured experiment logger: console + JSONL file + optional backends.
 
 Kept as a separate file (not merged into utils) because Logger has
-meaningful state (file handles, TB writer, W&B session) and a non-trivial
+meaningful state (file handles, TB writer) and a non-trivial
 lifecycle (open → log → close).
+
+Responsibilities
+--------
+  Metrics/events logging to JSONL, console, TensorBoard
+  Checkpoint saving
+  Config file saving
+  Summary file saving
 
 Backends
 --------
   Console    : always active
-  JSONL      : always written to log_dir/experiment_name.jsonl
+  JSONL      : always written to log_dir/metrics.jsonl
   TensorBoard: opt-in (tensorboard=True)
-  W&B        : opt-in (wandb_project="my-project")
 """
 
 from __future__ import annotations
 
 import json
+import platform
+import subprocess
 import sys
 import time
 from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
+
+import torch
 
 
 class _RunningMean:
@@ -39,37 +49,40 @@ class _RunningMean:
 
 class Logger:
     """
-    Unified experiment logger.
+    Unified experiment logger with checkpoint and config persistence.
 
     Parameters
     ----------
-    log_dir         : Directory where the JSONL file is written.
-    experiment_name : Used as the JSONL filename and W&B run name.
-    verbose         : Print to console.
-    tensorboard     : Enable TensorBoard SummaryWriter.
-    wandb_project   : W&B project name (None → disabled).
-    config          : Optional config dict logged as the first entry.
+    dir         : Experiment directory (base_dir/{experiment.name}).
+    verbose     : Print to console.
+    tensorboard : Enable TensorBoard SummaryWriter.
+
+    Subdirectories created under dir:
+    - logs/        : metrics.jsonl, tensorboard/
+    - checkpoints/ : model checkpoints
+    - artifacts/   : evaluation results, plots, etc.
+    - config.json  : merged configuration
     """
 
     def __init__(
         self,
-        log_dir: str,
-        experiment_name: str,
+        dir: str,
         verbose: bool = True,
         tensorboard: bool = False,
-        wandb_project: Optional[str] = None,
-        config: Optional[Dict] = None,
     ):
-        self.log_dir = Path(log_dir)
-        self.experiment_name = experiment_name
+        exp_dir = Path(dir)
+        self.experiment_name = exp_dir.name
+        self.log_dir = exp_dir / "logs"
+        self.checkpoint_dir = exp_dir / "checkpoints"
+        self.artifacts_dir = exp_dir / "artifacts"
+        self.config_path = exp_dir / "config.yaml"
         self.verbose = verbose
         self._start_time = time.time()
         self._running: Dict[str, _RunningMean] = defaultdict(_RunningMean)
 
         # JSONL
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self._jsonl_path = self.log_dir / f"{experiment_name}.jsonl"
-        self._jsonl_fh = open(self._jsonl_path, "w")
+        self._jsonl_fh = open(self.log_dir / "metrics.jsonl", "w")
 
         # TensorBoard
         self._tb_writer = None
@@ -77,24 +90,10 @@ class Logger:
             try:
                 from torch.utils.tensorboard import SummaryWriter
 
-                tb_dir = self.log_dir / "tensorboard" / experiment_name
+                tb_dir = self.log_dir / "tensorboard"
                 self._tb_writer = SummaryWriter(str(tb_dir))
             except ImportError:
                 print("[Logger] TensorBoard not installed; skipping.", file=sys.stderr)
-
-        # W&B
-        self._wandb = None
-        if wandb_project:
-            try:
-                import wandb
-
-                wandb.init(project=wandb_project, name=experiment_name, config=config)
-                self._wandb = wandb
-            except ImportError:
-                print("[Logger] wandb not installed; skipping.", file=sys.stderr)
-
-        if config:
-            self._write_jsonl({"event": "config", "config": config, "step": 0})
 
     # ------------------------------------------------------------------
     # Logging
@@ -119,9 +118,6 @@ class Logger:
             for k, v in prefixed.items():
                 if isinstance(v, (int, float)):
                     self._tb_writer.add_scalar(k, v, global_step=step)
-
-        if self._wandb:
-            self._wandb.log({**prefixed, "global_step": step})
 
         if self.verbose:
             keys_to_show = set(print_keys) if print_keys else set(prefixed.keys())
@@ -148,12 +144,39 @@ class Logger:
     # Lifecycle
     # ------------------------------------------------------------------
 
+    def save_checkpoint(self, tag: str, checkpoint_dict: Dict[str, Any]) -> None:
+        """Save model checkpoint with tag."""
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        path = self.checkpoint_dir / f"{self.experiment_name}_{tag}.pt"
+        torch.save(checkpoint_dict, path)
+        if self.verbose:
+            print(f"  Checkpoint saved: {path}", flush=True)
+
+    def save_config(self, config_dict: Dict[str, Any]) -> None:
+        """Save merged config to config.yaml."""
+        try:
+            import yaml  # type: ignore
+        except ImportError as exc:
+            raise ImportError("pyyaml is required. Install with: pip install pyyaml") from exc
+
+        self.config_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.config_path, "w") as f:
+            yaml.dump(config_dict, f, default_flow_style=False, sort_keys=False, indent=2)
+        if self.verbose:
+            print(f"  Config saved: {self.config_path}", flush=True)
+
+    def save_summary(self, summary: Dict[str, Any]) -> None:
+        """Save final training summary to summary.json."""
+        summary_path = self.config_path.parent / "summary.json"
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2, default=str)
+        if self.verbose:
+            print(f"  Summary saved: {summary_path}", flush=True)
+
     def close(self) -> None:
         self._jsonl_fh.close()
         if self._tb_writer:
             self._tb_writer.close()
-        if self._wandb:
-            self._wandb.finish()
 
     # ------------------------------------------------------------------
     # Internal
